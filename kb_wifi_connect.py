@@ -1,5 +1,4 @@
 import sys
-import os
 import subprocess
 import time
 import socket
@@ -9,8 +8,8 @@ import struct
 from loguru import logger
 
 # WiFi 和 TCP 服务器配置
-WIFI_SSID = os.getenv("UAV_WIFI_SSID", "uavap_tsang")
-WIFI_PWD = os.getenv("UAV_WIFI_PWD", "")
+WIFI_SSID = "uavap_tsang"
+WIFI_PWD = "888888887"
 TCP_HOST = "0.0.0.0" # 监听所有地址
 TCP_PORT = 5001 # 监听 5001 端口
 
@@ -483,10 +482,6 @@ def build_send_packet():
 
 
 if __name__ == "__main__":
-    if not WIFI_PWD:
-        logger.error("未设置 UAV_WIFI_PWD 环境变量，已停止连接 WiFi，避免把真实密码写入源码。")
-        sys.exit(1)
-
     wifiStatus = connect_wifi(WIFI_SSID, WIFI_PWD)
     logger.info("连接结果: {}", wifiStatus)
     logger.info("本机IP: {}", getLocalIP())
