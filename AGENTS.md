@@ -23,7 +23,10 @@
 - 日常开发按“小步提交”管理：完成一个清晰功能点、调参点、修复点或文档更新后，先检查 `git diff`，再 `git add -A`，最后 `git commit -m "<type>: <summary>"`。
 - 重大改动、跨文件重构、飞控控制逻辑修改或协议字段调整前，优先确认当前稳定状态已提交；必要时从 `main` 创建功能分支，例如 `git switch -c feature/landing-state-machine`。
 - 已实测稳定或需要长期引用的阶段版本，优先使用 Git tag 标记，例如 `git tag v6.9_tracking-tuning`；阶段性版本差异仍可写入 `CHANGELOG.md`，但详细历史以 Git commit 为准。
-- 当配置 GitHub 远程仓库后，使用 `git push` 同步本地提交；推送前再次检查 `git status` 和 `git log --oneline --decorate -5`，确认要上传的历史正确。
+- 当前 GitHub 远程仓库为 `origin = git@github.com:KrisBertram/graduation_uav_onboard.git`；`origin/main` 表示 GitHub 远程仓库上的 `main` 分支在本地的追踪引用。
+- 当前工作区通过 SSH key 与 GitHub 通信；SSH 私钥只应保存在本机 `~/.ssh/` 下，不能提交到仓库、复制到文档或发送给他人。公钥可添加到 GitHub 的 SSH keys 页面。
+- 推送到 GitHub 由 Codex 根据改动价值判断：重要文档约定、阶段性功能、实测前后状态、稳定修复和需要云端备份的提交应及时 `git push`；零碎试验或尚未验证的本地改动可先只保留在本地 commit 或工作区。
+- 推送前再次检查 `git status`、`git log --oneline --decorate -5` 和当前分支跟踪关系，确认要上传的历史正确；已建立 upstream 后通常直接使用 `git push`。
 - `AGENTS.md` 只记录当前项目结构、协作约定和安全边界，不记录逐版本变更历史。
 
 ## 重点目录与文件
@@ -195,4 +198,6 @@
 - 查看 Git 状态：`git status --short`
 - 查看未提交改动：`git diff`
 - 查看最近提交：`git log --oneline --decorate -5`
+- 查看远程仓库：`git remote -v`
+- 推送当前分支：`git push`
 - 若缺少硬件或依赖导致无法运行，应在最终回复中明确说明未进行真实硬件验证。
