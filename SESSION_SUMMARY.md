@@ -22,7 +22,7 @@
 - 当前工程已整理为以根目录 `main.py` 为主入口的无人机端主链路工程。
 - 视觉检测、车机 TCP 状态接入、参考轨迹跟踪、飞控控制、UDP 图传和调试工具都围绕当前工程结构继续开发。
 - `test/` 目录主要保留独立功能验证、离线调参、标志生成和辅助脚本。
-- 当前工作区不是 Git 仓库，后续改动需要更谨慎；重大改动前按 `AGENTS.md` 约定创建 `backup/v<major.minor>_<summary>/` 版本化源码快照。
+- 当前工作区已初始化为 Git 仓库，默认分支为 `main`，并已连接 GitHub 远程仓库 `origin = git@github.com:KrisBertram/graduation_uav_onboard.git`。
 
 ## 硬件安全边界
 
@@ -56,20 +56,23 @@ python3 -m py_compile main.py uav_core/*.py test/*.py
 - `v6.7_shape-coded-color-markers`：将 6 色圆点升级为 3 色 × 2 形状编码标记，并增强检测逻辑。
 - `v6.8_green-yellow-separation`：绿色/纯黄色分离增强，当前彩色标志颜色类为 `green/purple/yellow`。
 
-## 备份与恢复机制
+## Git / GitHub 版本管理
 
-已建立版本化源码快照机制：
+- 后续版本管理以 Git commit、branch、tag 和 GitHub 远程仓库为准；`backup/` 目录仅作为历史快照资料保留，默认不再更新。
+- 当前 `main` 已推送到 GitHub，`origin/main` 表示 GitHub 远程仓库上的 `main` 分支在本地的追踪引用。
+- 本工作区通过 SSH key 与 GitHub 通信；私钥只保存在本机 `~/.ssh/`，不要提交到仓库或写入文档。
+- 日常开发建议小步提交：`git status` -> `git diff` -> `git add -A` -> `git commit -m "..."`。
+- 是否 `git push` 由 Codex 根据改动价值判断：重要文档约定、阶段性功能、实测前后状态、稳定修复和需要云端备份的提交应及时推送；零碎试验可先留在本地。
+- 重大改动、跨文件重构、飞控控制逻辑修改或协议字段调整前，优先确认当前稳定状态已提交；必要时从 `main` 创建功能分支。
 
-- 备份目录形如 `backup/v6.8_green-yellow-separation/`。
-- 每个备份目录应包含 `manifest.json`、`restore.py`、`files/`。
-- 运行恢复脚本：
+本会话已完成并推送到 GitHub 的提交：
 
-```bash
-python3 backup/<version_summary>/restore.py
-```
+- `4143755 chore: establish local git baseline`
+- `5b68fb7 chore: restore hardcoded wifi config`
+- `08710d7 docs: switch version management to git`
+- `b044d19 docs: document github sync workflow`
 
-- 恢复前脚本会自动把当前受管理源码保存到 `backup/emergency_<timestamp>_before_restore/`。
-- emergency 快照也带 `restore.py`，可用于恢复误恢复前状态。
+另外，本会话中用户确认 WiFi SSID/密码不作为敏感信息处理，`kb_wifi_connect.py` 已恢复为硬编码配置；`.env.example` 已删除。
 
 ## 当前主链路关键开关
 
@@ -340,7 +343,8 @@ python3 -m py_compile uav_core/apriltag_pose.py uav_core/color_marker_pose.py ma
 ## 给下一个会话的提醒
 
 - 先读 `AGENTS.md`，尤其是坐标系约定和硬件安全边界。
+- 版本管理约定已改为 Git/GitHub；不要再要求创建新的 `backup/` 源码快照。
 - 不要把 `CHANGELOG.md` 中的历史尺寸误认为当前尺寸；当前尺寸以源码和 `AGENTS.md` 的“当前重要实现细节”为准。
 - 不要把早期 6 色圆点方案误认为当前方案；当前是 `green/purple/yellow` 三色 × 圆/方两形状。
 - 不要默认运行真实硬件脚本。
-- 做跨文件、控制链路或协议改动前，先创建版本化备份。
+- 做跨文件、控制链路或协议改动前，先确认当前稳定状态已提交；必要时创建 Git 分支。
