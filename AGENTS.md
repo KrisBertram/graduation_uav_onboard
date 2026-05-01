@@ -14,16 +14,17 @@
 - 如果读取中文注释时出现乱码，先尝试用正确编码重新读取；若仍无法解决，必须暂停并告知用户，不能忽略注释继续改代码。
 - 文件名或库名以 `kb_` 开头的，通常是用户本人编写或二次开发的代码，应优先关注。
 - 保留现有中文注释和日志风格；新增注释应简洁，优先解释坐标系、协议、飞控安全相关逻辑。
-- 本工作区当前不是 Git 仓库。做改动时要更谨慎，必要时在回复中清楚说明新增/修改了哪些文件。
+- 本工作区已初始化为 Git 仓库，默认分支为 `main`。后续版本管理以 Git 提交、分支、标签和 GitHub 远程仓库为准。
 
-## 备份与恢复约定
+## Git 版本管理约定
 
-- 每次进行重大改动、跨文件重构、飞控控制逻辑修改或协议字段调整前，必须先在 `backup/` 下创建版本化源码快照。
-- 备份目录命名格式为 `backup/v<major.minor>_<short-summary>/`，例如 `backup/v6.0_tracking-baseline/`；概要用 2~3 个英文词概括当前工程状态。
-- 备份范围默认采用源码快照：根目录核心 `.py`、`AGENTS.md`、`CHANGELOG.md`、`uav_core/`、`mavlink/`、`utils/`、`test/`；默认排除 `backup/`、`image_output/`、`temp/`、`reference/`、`__pycache__/`、`*.pyc`。
-- 每个版本化备份目录必须包含 `manifest.json` 和 `restore.py`。运行 `python backup/<version_summary>/restore.py` 应能把当前工程恢复到该备份状态。
-- 恢复脚本执行覆盖前，必须先把当前受管理源码保存为 `backup/emergency_<timestamp>_before_restore/`，避免误恢复导致当前工作丢失。
-- 版本改动记录统一写入 `CHANGELOG.md`；`AGENTS.md` 只记录当前项目结构、协作约定和安全边界，不记录逐版本变更历史。
+- 后续不再为常规开发创建 `backup/v<major.minor>_<summary>/` 本地源码快照；`backup/` 目录仅作为历史快照资料保留，默认不再更新。
+- 每次开始改动前，先用 `git status` 确认工作区状态；如果已有未提交改动，必须判断这些改动是否属于当前任务，不能误覆盖或回退用户改动。
+- 日常开发按“小步提交”管理：完成一个清晰功能点、调参点、修复点或文档更新后，先检查 `git diff`，再 `git add -A`，最后 `git commit -m "<type>: <summary>"`。
+- 重大改动、跨文件重构、飞控控制逻辑修改或协议字段调整前，优先确认当前稳定状态已提交；必要时从 `main` 创建功能分支，例如 `git switch -c feature/landing-state-machine`。
+- 已实测稳定或需要长期引用的阶段版本，优先使用 Git tag 标记，例如 `git tag v6.9_tracking-tuning`；阶段性版本差异仍可写入 `CHANGELOG.md`，但详细历史以 Git commit 为准。
+- 当配置 GitHub 远程仓库后，使用 `git push` 同步本地提交；推送前再次检查 `git status` 和 `git log --oneline --decorate -5`，确认要上传的历史正确。
+- `AGENTS.md` 只记录当前项目结构、协作约定和安全边界，不记录逐版本变更历史。
 
 ## 重点目录与文件
 
@@ -183,7 +184,7 @@
 - 修改图传逻辑时，保持 UDP 包头格式和接收端一致；`FRAG_DATA_SIZE` 变更会影响链路丢包和延迟。
 - 不要把 `image_output/` 中的图片/视频作为代码上下文，除非用户明确要求分析某次飞行记录。
 - 不要基于 `temp/` 中内容推断当前实现，除非用户明确要求追溯历史方案。
-- 不要把历史版本变更写进 `AGENTS.md`；需要记录版本差异时更新 `CHANGELOG.md`。
+- 不要把历史版本变更写进 `AGENTS.md`；日常变更以 Git commit 记录，阶段性版本差异可更新 `CHANGELOG.md`。
 
 ## 常用检查方式
 
@@ -191,4 +192,7 @@
 - 查看无人机端主项目结构：`rg -n "^(class|def|async def)|^if __name__" . -g '*.py' -g '!image_output/**' -g '!temp/**' -g '!reference/**'`
 - 查看无人车端协议相关文件：`rg -n "serial_datapacket|RecvPacket|SendPacket|send_desc|recv_desc|0x01|0x02|CRC|WIFI_|TCP_" reference/graduation_ugv_firmware/code reference/graduation_ugv_firmware/user reference/graduation_ugv_firmware/docs`
 - 语法检查可优先尝试：`python -m py_compile <file.py>`
+- 查看 Git 状态：`git status --short`
+- 查看未提交改动：`git diff`
+- 查看最近提交：`git log --oneline --decorate -5`
 - 若缺少硬件或依赖导致无法运行，应在最终回复中明确说明未进行真实硬件验证。
