@@ -1,0 +1,126 @@
+{
+  "created_at": "2026-04-29T23:06:31",
+  "source": "video",
+  "path": "image_output/video/output.mp4",
+  "camera_index": 0,
+  "opencv_hsv_range": {
+    "H": [
+      0,
+      179
+    ],
+    "S": [
+      0,
+      255
+    ],
+    "V": [
+      0,
+      255
+    ]
+  },
+  "marker_order": [
+    "positive_x",
+    "negative_x",
+    "positive_y",
+    "negative_y",
+    "redundant_top_right",
+    "redundant_bottom_left"
+  ],
+  "thresholds": {
+    "positive_x": [
+      {
+        "lower": [
+          164,
+          72,
+          105
+        ],
+        "upper": [
+          179,
+          163,
+          204
+        ]
+      },
+      {
+        "lower": [
+          0,
+          72,
+          105
+        ],
+        "upper": [
+          0,
+          163,
+          204
+        ]
+      }
+    ],
+    "negative_x": [
+      {
+        "lower": [
+          7,
+          21,
+          120
+        ],
+        "upper": [
+          23,
+          98,
+          209
+        ]
+      }
+    ],
+    "positive_y": [
+      {
+        "lower": [
+          97,
+          73,
+          91
+        ],
+        "upper": [
+          113,
+          166,
+          187
+        ]
+      }
+    ],
+    "negative_y": [
+      {
+        "lower": [
+          105,
+          65,
+          88
+        ],
+        "upper": [
+          121,
+          149,
+          178
+        ]
+      }
+    ],
+    "redundant_top_right": [
+      {
+        "lower": [
+          91,
+          105,
+          95
+        ],
+        "upper": [
+          107,
+          212,
+          193
+        ]
+      }
+    ],
+    "redundant_bottom_left": [
+      {
+        "lower": [
+          118,
+          24,
+          67
+        ],
+        "upper": [
+          134,
+          121,
+          158
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "name": "nested_apriltag_color_board_a3",
+  "dpi": 1200,
+  "page": {
+    "paper": "A3",
+    "width_m": 0.42,
+    "height_m": 0.297
+  },
+  "coordinate_convention": {
+    "origin": "AprilTag center",
+    "x_positive": "paper right / Tag +X / vehicle left after installation",
+    "y_positive": "paper down / Tag +Y / vehicle front after installation",
+    "z": "0 for all printed color marker centers",
+    "unit": "meter"
+  },
+  "apriltag": {
+    "family": "tagCustom48h12",
+    "outer_tag_id": 65,
+    "outer_tag_size_m": 0.2,
+    "nested_tag_ids": [
+      65,
+      66,
+      67
+    ]
+  },
+  "color_markers": [
+    {
+      "name": "positive_x",
+      "axis": "+X",
+      "color_class": "purple",
+      "shape": "circle",
+      "color_hex": "#7A00FF",
+      "size_m": 0.032,
+      "object_point_m": [
+        0.1185,
+        0.0,
+        0.0
+      ],
+      "description": "Tag +X，紫色圆形，安装后位于无人车左侧"
+    },
+    {
+      "name": "negative_x",
+      "axis": "-X",
+      "color_class": "purple",
+      "shape": "square",
+      "color_hex": "#7A00FF",
+      "size_m": 0.032,
+      "object_point_m": [
+        -0.1185,
+        0.0,
+        0.0
+      ],
+      "description": "Tag -X，紫色正方形，安装后位于无人车右侧"
+    },
+    {
+      "name": "positive_y",
+      "axis": "+Y",
+      "color_class": "green",
+      "shape": "circle",
+      "color_hex": "#00B83F",
+      "size_m": 0.032,
+      "object_point_m": [
+        0.0,
+        0.1185,
+        0.0
+      ],
+      "description": "Tag +Y，绿色圆形，安装后朝无人车车头"
+    },
+    {
+      "name": "negative_y",
+      "axis": "-Y",
+      "color_class": "green",
+      "shape": "square",
+      "color_hex": "#00B83F",
+      "size_m": 0.032,
+      "object_point_m": [
+        0.0,
+        -0.1185,
+        0.0
+      ],
+      "description": "Tag -Y，绿色正方形，安装后朝无人车车尾"
+    },
+    {
+      "name": "redundant_top_right",
+      "axis": "+X/-Y",
+      "color_class": "yellow",
+      "shape": "circle",
+      "color_hex": "#FFFF00",
+      "size_m": 0.032,
+      "object_point_m": [
+        0.1185,
+        -0.1185,
+        0.0
+      ],
+      "description": "右上冗余点，纯黄色圆形，用于彩色 PnP 和误检校验"
+    },
+    {
+      "name": "redundant_bottom_left",
+      "axis": "-X/+Y",
+      "color_class": "yellow",
+      "shape": "square",
+      "color_hex": "#FFFF00",
+      "size_m": 0.032,
+      "object_point_m": [
+        -0.1185,
+        0.1185,
+        0.0
+      ],
+      "description": "左下冗余点，纯黄色正方形，用于彩色 PnP 和误检校验"
+    }
+  ],
+  "print_note": "A3 纸，打印时关闭适合页面/缩放到纸张，按 100% 原始尺寸打印。"
+}

@@ -1,0 +1,496 @@
+"""
+20260311 日志
+
+由于幻思说 MAV_FRAME_BODY_OFFSET_NED 飞控端没有支持，
+所以暂时先用 MAV_FRAME_LOCAL_NED 来实现机体系控制，
+该版本弃用，更名为 kb_DataLink_v0.backup, 保留作为备份。
+"""
+
+"""
+DataLink 模块
+-----------------------------------------
+功能：
+1. 通过串口与飞控进行 MAVLink 通信
+2. 接收飞控状态信息
+3. 发送位置 / 姿态 / 起降等控制指令
+
+坐标系说明：
+- LOCAL_NED: x北 y东 z下 (单位：米) - 原点固定相对地球
+- LOCAL_OFFSET_NED: x北 y东 z下 (单位：米) - 原点随飞行器移动
+- BODY_NED: 表示位置时等同于 LOCAL_NED; 表示速度 / 加速度时等同于 BODY_FRD
+- BODY_OFFSET_NED / BODY_FRD: x前 y右 z下 (单位：米) - 机体坐标系，原点随飞行器移动
+- 姿态单位：弧度
+"""
+
+import sys
+import time
+import serial
+import math
+import mavlink.mavlink as mavlink
+from loguru import logger
+
+class DataLink:
+    """
+    与飞控通信的核心类
+    """
+
+    # ==============================
+    # 飞控反馈状态结构
+    # ==============================
+    class DroneState:
+        """
+        存储从飞控接收到的实时状态
+        """
+
+        def __init__(self):
+            # 位置（LOCAL_NED 坐标系，单位：米）
+            self.x = 0.0
+            self.y = 0.0
+            self.z = 0.0
+
+            # 姿态（单位：弧度）
+            self.roll = 0.0
+            self.pitch = 0.0
+            self.yaw = 0.0
+
+            # 相对高度（单位：米）
+            self.relative_alt = 0.0
+
+            # 电池信息
+            self.battery_voltage = 0.0  # V
+            self.battery_current = 0.0  # A
+
+            self.heartbeat_count = 0 # 心跳次数
+            self.last_heartbeat_time = 0 # 上次心跳时间
+            self.time_since_last_heartbeat = 0 # 距离上次心跳的时间
+
+
+    # ==============================
+    # 控制目标结构
+    # ==============================
+    class DroneTarget:
+        """
+        存储准备发送给飞控的控制目标
+        """
+
+        def __init__(self):
+            # 目标位置（LOCAL_NED 坐标系，单位：米）
+            self.x = 0.0
+            self.y = 0.0
+            self.z = 0.0
+
+            # 目标姿态（单位：弧度）
+            self.roll = 0.0
+            self.pitch = 0.0
+            self.yaw = 0.0
+
+
+    # ==============================
+    # 初始化
+    # ==============================
+    def __init__(self, port='/dev/ttyTHS0', baudrate=460800):
+
+        # 串口
+        self.serial_port = serial.Serial(port, baudrate, timeout=1.0)
+
+        # MAVLink 实例
+        self.mavlink = None
+
+        # 当前接收到的 MAVLink 消息
+        self.message = None
+
+        # 无人机状态、目标
+        self.state = self.DroneState()
+        self.target = self.DroneTarget()
+
+
+    # ==============================
+    # MAVLink 初始化
+    # ==============================
+    class SerialWrapper:
+        """
+        让 MAVLink 可以写入串口的包装器
+        """
+        def __init__(self, file):
+            self.file = file
+            self.buf = []
+        def write(self, data):
+            self.file.write(data)
+
+    def init_mavlink(self):
+        """
+        初始化 MAVLink 通信
+        """
+        wrapper = self.SerialWrapper(self.serial_port)
+        self.mavlink = mavlink.MAVLink(wrapper)
+
+
+    # ==============================
+    # 接收线程
+    # ==============================
+    def receive_loop(self):
+        """
+        持续读取串口并解析 MAVLink 消息
+        """
+        while True:
+            if self.serial_port.is_open:
+                try:
+                    byte = self.serial_port.read(1)
+                except Exception as err:
+                    logger.error(f"读取串口时发生异常: {err}")
+                    continue
+            else:
+                logger.error("串口未打开")
+                continue
+
+            if byte == b'': continue
+            if ord(byte) < 0: continue
+
+            try:
+                msg = self.mavlink.parse_char(byte)
+                if msg is None: continue
+
+                self.message = msg
+                msg_id = msg.get_msgId()
+
+                # 心跳
+                if msg_id == mavlink.MAVLINK_MSG_ID_HEARTBEAT:
+                    if self.state.heartbeat_count < 1e6: self.state.heartbeat_count += 1
+                    self.state.time_since_last_heartbeat = time.time() - self.state.last_heartbeat_time
+                    self.state.last_heartbeat_time = time.time()
+                    # logger.debug(f"心跳更新:\n\
+                    #             心跳次数 = {self.state.heartbeat_count}\n\
+                    #             距离上次心跳的时间 = {self.state.time_since_last_heartbeat:.6f} s")
+
+                # 位置
+                elif msg_id == mavlink.MAVLINK_MSG_ID_GLOBAL_VISION_POSITION_ESTIMATE:
+                    if isinstance(msg, mavlink.MAVLink_global_vision_position_estimate_message):
+                        self.state.x = msg.x / 100.0
+                        self.state.y = msg.y / 100.0
+                        self.state.z = msg.z / 100.0
+
+                        self.state.roll = msg.roll
+                        self.state.pitch = msg.pitch
+                        self.state.yaw = msg.yaw
+
+                        # logger.debug(f"位置更新:\n\
+                        #             Position = ({self.state.x:.2f}, {self.state.y:.2f}, {self.state.z:.2f}) m\n\
+                        #             Attitude = ({math.degrees(self.state.roll):.2f}, {math.degrees(self.state.pitch):.2f}, {math.degrees(self.state.yaw):.2f}) deg")
+
+                # 高度
+                elif msg_id == mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT:
+                    if isinstance(msg, mavlink.MAVLink_global_position_int_message):
+                        self.state.relative_alt = msg.relative_alt / 1000.0
+                        # logger.debug(f"高度更新:\nRelative Altitude = {self.state.relative_alt:.2f} m")
+
+                # 电池
+                elif msg_id == mavlink.MAVLINK_MSG_ID_BATTERY_STATUS:
+                    if isinstance(msg, mavlink.MAVLink_battery_status_message):
+                        self.state.battery_voltage = msg.voltages[1] / 1000.0
+                        self.state.battery_current = msg.current_battery / 100.0
+                        # logger.debug(f"电池更新:\n\
+                        #             Voltage = {self.state.battery_voltage:.2f} V\n\
+                        #             Current = {self.state.battery_current:.2f} A")
+            except Exception as err:
+                self.message = None
+                logger.debug(f"解析 MAVLink 消息时发生异常: {err}")
+                continue
+
+
+    # ==============================
+    # 基础控制指令
+    # ==============================
+
+    def send_heartbeat(self):
+        '''
+        发送心跳消息，保持与飞控的连接
+        '''
+        while True:
+            self.mavlink.heartbeat_send(mavlink.MAV_TYPE_GCS, mavlink.MAV_AUTOPILOT_INVALID, mavlink.MAV_MODE_FLAG_MANUAL_INPUT_ENABLED, 0, mavlink.MAV_STATE_STANDBY, 1)
+            time.sleep(1)
+
+    def set_arm(self):
+        """解锁电机"""
+        self.mavlink.set_mode_send(0, mavlink.MAV_MODE_AUTO_ARMED, 0)
+
+
+    def set_disarm(self):
+        """锁定电机"""
+        self.mavlink.set_mode_send(0, mavlink.MAV_MODE_AUTO_DISARMED, 0)
+
+
+    def set_takeoff(self, altitude=0):
+        """
+        起飞
+        
+        参数：
+        altitude : 目标高度（米），默认 0 米
+        """
+        self.mavlink.command_long_send(
+            0, 0,  # target_system, target_component
+            mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,  # confirmation
+            0, 0, 0, 0,  # param1-4: 未使用
+            0, 0,  # param5-6: 纬度、经度（未使用）
+            altitude  # param7: 目标高度
+        )
+
+
+    def set_land(self):
+        """降落"""
+        self.mavlink.command_long_send(
+            0, 0,  # target_system, target_component
+            mavlink.MAV_CMD_NAV_LAND,
+            0,  # confirmation
+            0, 0, 0, 0,  # param1-4: 未使用
+            0, 0, 0  # param5-7: 纬度、经度、高度（未使用）
+        )
+
+    def set_altitude(self, altitude):
+        """
+        设置目标高度（相对高度，单位：米）
+        """
+        self.target.z = altitude
+        
+        # type_mask: 忽略 x, y 位置、速度、加速度、偏航角、偏航速率
+        type_mask = mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE | \
+                    mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
+
+        self.mavlink.set_position_target_local_ned_send(
+            0,  # time_boot_ms (未使用，由飞控填充)
+            0, 0,  # target_system, target_component
+            mavlink.MAV_FRAME_LOCAL_NED,  # coordinate_frame
+            type_mask,  # type_mask
+            0, 0, altitude,  # 位置
+            0, 0, 0,  # 速度 (忽略)
+            0, 0, 0,  # 加速度 (忽略)
+            0, 0 # yaw (忽略), yaw_rate (忽略)
+        )
+
+    # ==============================
+    # 位置控制 - LOCAL_NED 坐标系
+    # ==============================
+
+    def set_local_ned_target_position(self, x, y, z, yaw):
+        """
+        在本地 NED 坐标系中设置目标位置
+        
+        对应 MAV_FRAME_LOCAL_NED (1):
+        NED 局部切线坐标系 (x: 北, y: 东, z: 下)
+        原点相对于地球固定，为飞行器起飞时的 EKF 原点
+
+        参数：
+        x, y, z : 目标位置（米）
+        yaw     : 目标航向角（弧度）
+        """
+        
+        self.target.x = x
+        self.target.y = y
+        self.target.z = z
+        self.target.yaw = yaw
+
+        # type_mask: 忽略速度、加速度、yaw_rate
+        # 8(VX) | 16(VY) | 32(VZ) | 64(AX) | 128(AY) | 256(AZ) | 2048(YAW_RATE) = 2552
+        type_mask = 2552
+
+        self.mavlink.set_position_target_local_ned_send(
+            0,  # time_boot_ms (未使用，由飞控填充)
+            0, 0,  # target_system, target_component
+            mavlink.MAV_FRAME_LOCAL_NED,  # coordinate_frame
+            type_mask,  # type_mask
+            x, y, z,  # 位置
+            0, 0, 0,  # 速度 (忽略)
+            0, 0, 0,  # 加速度 (忽略)
+            yaw,  # yaw
+            0  # yaw_rate (忽略)
+        )
+
+
+    def set_local_offset_ned_target_position(self, dx, dy, dz, dyaw):
+        """
+        在本地 NED 坐标系中设置相对位置
+        
+        对应 MAV_FRAME_LOCAL_OFFSET_NED (7):
+        NED 局部切线坐标系 (x: 北, y: 东, z: 下)
+        原点随飞行器移动（相对于当前位置的偏移）
+
+        参数：
+        dx, dy, dz : 相对位置偏移（米）
+        dyaw       : 相对航向角偏移（弧度）
+        """
+        
+        # 更新目标位置（用于记录，实际坐标由飞控计算）
+        self.target.x = self.state.x + dx
+        self.target.y = self.state.y + dy
+        self.target.z = self.state.z + dz
+        self.target.yaw = self.state.yaw + dyaw
+
+        # type_mask: 忽略速度、加速度、yaw_rate
+        # 8(VX) | 16(VY) | 32(VZ) | 64(AX) | 128(AY) | 256(AZ) | 2048(YAW_RATE) = 2552
+        type_mask = 2552
+
+        self.mavlink.set_position_target_local_ned_send(
+            0,  # time_boot_ms
+            0, 0,  # target_system, target_component
+            mavlink.MAV_FRAME_LOCAL_OFFSET_NED,  # coordinate_frame
+            type_mask,  # type_mask
+            dx, dy, dz,  # 相对位置偏移
+            0, 0, 0,  # 速度 (忽略)
+            0, 0, 0,  # 加速度 (忽略)
+            dyaw,  # 相对 yaw
+            0  # yaw_rate (忽略)
+        )
+
+
+    # ==============================
+    # 位置控制 - 机体坐标系
+    # ==============================
+
+    def set_body_ned_target_position(self, x, y, z, yaw):
+        """
+        在机体系 NED 坐标系中设置目标位置
+        
+        对应 MAV_FRAME_BODY_NED (8):
+        在表示位置值时，与 MAV_FRAME_LOCAL_NED 相同
+        在表示速度 / 加速度值时，与 MAV_FRAME_BODY_FRD 相同
+        
+        注意：此接口用于位置控制，因此行为等同于 LOCAL_NED
+        如果需要机体系速度控制，应使用速度模式并设置对应的 type_mask
+        暂时不需要用到此接口，先保留接口定义
+
+        参数：
+        x, y, z : 目标位置（米, NED 坐标系）
+        yaw     : 目标航向角（弧度）
+        """
+        
+        pass
+
+
+    def set_body_offset_ned_target_position(self, dx, dy, dz, dyaw):
+        """
+        在机体系坐标系中设置相对位置
+        
+        对应 MAV_FRAME_BODY_OFFSET_NED (9) / MAV_FRAME_BODY_FRD (12):
+        FRD 局部坐标系与飞行器姿态对齐 (x: 前方, y: 右侧, z: 下方)
+        - X轴: 机体前方 (Forward)
+        - Y轴: 机体右侧 (Right) 
+        - Z轴: 机体下方 (Down)
+        - 原点: 飞行器当前位置
+        
+        典型应用场景：
+        - dx > 0: 向前移动
+        - dy > 0: 向右移动
+        - dz < 0: 向上移动（注意 NED 坐标系 z 向下为正）
+        - dyaw > 0: 逆时针旋转
+
+        参数：
+        dx, dy, dz : 机体系相对位置偏移（米）, dx: 前/后, dy: 右/左, dz: 下/上
+        dyaw       : 相对航向角偏移（弧度）
+        """
+        
+        # 计算全局系的目标位置（用于记录）
+        current_yaw = self.state.yaw
+        
+        # 将机体系偏移转换为全局系
+        global_dx = dx * math.cos(current_yaw) - dy * math.sin(current_yaw)
+        global_dy = dx * math.sin(current_yaw) + dy * math.cos(current_yaw)
+        
+        self.target.x = self.state.x + global_dx
+        self.target.y = self.state.y + global_dy
+        self.target.z = self.state.z + dz
+        self.target.yaw = current_yaw + dyaw
+        
+        # type_mask: 忽略速度、加速度、yaw_rate
+        # 8(VX) | 16(VY) | 32(VZ) | 64(AX) | 128(AY) | 256(AZ) | 2048(YAW_RATE) = 2552
+        type_mask = 2552
+
+        self.mavlink.set_position_target_local_ned_send(
+            0,  # time_boot_ms
+            0, 0,  # target_system, target_component
+            mavlink.MAV_FRAME_BODY_OFFSET_NED,  # coordinate_frame
+            type_mask,  # type_mask
+            dx, dy, dz,  # 机体系相对位置偏移
+            0, 0, 0,  # 速度 (忽略)
+            0, 0, 0,  # 加速度 (忽略)
+            dyaw,  # 相对 yaw
+            0  # yaw_rate (忽略)
+        )
+
+
+    # ==============================
+    # 便捷控制函数（机体系）
+    # ==============================
+
+    def move_forward(self, distance):
+        """向前移动指定距离（米）"""
+        self.set_body_offset_ned_target_position(distance, 0, 0, 0)
+
+
+    def move_backward(self, distance):
+        """向后移动指定距离（米）"""
+        self.set_body_offset_ned_target_position(-distance, 0, 0, 0)
+
+
+    def move_right(self, distance):
+        """向右移动指定距离（米）"""
+        self.set_body_offset_ned_target_position(0, distance, 0, 0)
+
+
+    def move_left(self, distance):
+        """向左移动指定距离（米）"""
+        self.set_body_offset_ned_target_position(0, -distance, 0, 0)
+
+
+    def move_up(self, distance):
+        """向上移动指定距离（米）"""
+        self.set_body_offset_ned_target_position(0, 0, -distance, 0)
+
+
+    def move_down(self, distance):
+        """向下移动指定距离（米）"""
+        self.set_body_offset_ned_target_position(0, 0, distance, 0)
+
+
+    def rotate_left(self, angle):
+        """向左（逆时针）旋转指定角度（弧度）"""
+        self.set_body_offset_ned_target_position(0, 0, 0, angle)
+
+
+    def rotate_right(self, angle):
+        """向右（顺时针）旋转指定角度（弧度）"""
+        self.set_body_offset_ned_target_position(0, 0, 0, -angle)
+
+
+    # ==============================
+    # 状态查询
+    # ==============================
+
+    def get_position(self):
+        """获取当前位置（LOCAL_NED 坐标系）"""
+        return (self.state.x, self.state.y, self.state.z)
+
+
+    def get_attitude(self):
+        """获取当前姿态（弧度）"""
+        return (self.state.roll, self.state.pitch, self.state.yaw)
+
+
+    def get_altitude(self):
+        """获取相对高度（米）"""
+        return self.state.relative_alt
+
+
+    def get_battery_info(self):
+        """获取电池信息"""
+        return {
+            'voltage': self.state.battery_voltage,
+            'current': self.state.battery_current
+        }

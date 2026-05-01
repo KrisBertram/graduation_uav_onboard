@@ -1,0 +1,33 @@
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets and machine-specific config
+.env
+*.env
+!.env.example
+.vscode/
+
+# Runtime outputs and temporary files
+image_output/
+temp/
+*.log
+
+# Local source snapshots are kept outside Git history.
+backup/
+
+# Read-only external reference repository.
+reference/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*~
