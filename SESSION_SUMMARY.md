@@ -58,7 +58,7 @@ python3 -m py_compile main.py uav_core/*.py test/*.py
 
 ## Git / GitHub 版本管理
 
-- 后续版本管理以 Git commit、branch、tag 和 GitHub 远程仓库为准；`backup/` 目录仅作为历史快照资料保留，默认不再更新。
+- 后续版本管理以 Git commit、branch、tag 和 GitHub 远程仓库为准；`backup/` 目录仅作为历史快照资料保留，默认不再更新。详细的情况与状态可以参考 `AGENTS.md` 中的说明。
 - 当前 `main` 已推送到 GitHub，`origin/main` 表示 GitHub 远程仓库上的 `main` 分支在本地的追踪引用。
 - 本工作区通过 SSH key 与 GitHub 通信；私钥只保存在本机 `~/.ssh/`，不要提交到仓库或写入文档。
 - 日常开发建议小步提交：`git status` -> `git diff` -> `git add -A` -> `git commit -m "..."`。
@@ -343,7 +343,7 @@ python3 -m py_compile uav_core/apriltag_pose.py uav_core/color_marker_pose.py ma
 ## 给下一个会话的提醒
 
 - 先读 `AGENTS.md`，尤其是坐标系约定和硬件安全边界。
-- 版本管理约定已改为 Git/GitHub；不要再要求创建新的 `backup/` 源码快照。
+- 版本管理约定已改为 Git/GitHub；不要再要求创建新的 `backup/` 源码快照。详细情况可以参考 `AGENTS.md` 中的说明。
 - 不要把 `CHANGELOG.md` 中的历史尺寸误认为当前尺寸；当前尺寸以源码和 `AGENTS.md` 的“当前重要实现细节”为准。
 - 不要把早期 6 色圆点方案误认为当前方案；当前是 `green/purple/yellow` 三色 × 圆/方两形状。
 - 不要默认运行真实硬件脚本。
