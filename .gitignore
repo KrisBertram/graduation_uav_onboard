@@ -18,6 +18,7 @@ env/
 
 # Runtime outputs and temporary files
 image_output/
+logs/
 temp/
 *.log
 

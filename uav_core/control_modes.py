@@ -9,6 +9,14 @@ from loguru import logger
 
 control_mode = 0  # 0=手动待机，1=起飞，2=降落，3=悬停待机，4=AprilTag 跟踪
 
+CONTROL_MODE_NAMES = {
+    0: "manual",
+    1: "takeoff",
+    2: "land",
+    3: "hold",
+    4: "tracking",
+}
+
 # ---------- 飞控模式调参 ----------
 # 这些参数会直接影响真实飞控动作，实测前应逐项确认；不要在不了解飞控响应时一次性大幅调整。
 
@@ -16,6 +24,11 @@ control_mode = 0  # 0=手动待机，1=起飞，2=降落，3=悬停待机，4=Ap
 # 调大：更稳妥但起飞流程更慢；调小：流程更快但可能在飞控未准备好时发送起飞。
 # 推荐范围：0.5~2.0 s；初始推荐 1.0 s。
 ARM_WAIT_S = 1.0
+
+# 起飞指令高度参数：传给 data_link.set_takeoff() 的 altitude 字段。
+# 当前主链路实际爬升高度由 TAKEOFF_HOLD_Z_M 的 set_pose 目标控制，因此这里保持 0.0 不变。
+# 调整前必须确认飞控 set_takeoff() 对 altitude 的具体解释；不确认时推荐保持 0.0。
+TAKEOFF_COMMAND_ALTITUDE_M = 0.0
 
 # 起飞指令后等待时间：等待飞控完成起飞初始动作，再发送后续高度/位置目标。
 # 调大：更保守；调小：可能过早覆盖起飞目标。
@@ -52,6 +65,14 @@ TRACK_DIRECT_Z_ENABLE_BELOW_M = 1.8
 # 调小：更快进入零位移保护；过小可能因瞬时漏检频繁保护。
 # 推荐范围：1~3 s；初始推荐 2 s。
 TRACK_LOST_GRACE_S = 2.0
+
+
+def get_control_mode_snapshot():
+    """返回当前控制模式快照，供主循环和飞行日志低频采样使用。"""
+    return {
+        "id": control_mode,
+        "name": CONTROL_MODE_NAMES.get(control_mode, "unknown"),
+    }
 
 
 def keyboard_listener():
@@ -103,7 +124,7 @@ def handle_control_mode(data_link, control_target_valid, cmd_dx=0, cmd_dy=0, cmd
         logger.info("收到指令：解锁电机并起飞")
         data_link.set_arm()
         time.sleep(ARM_WAIT_S)
-        data_link.set_takeoff(altitude=0)
+        data_link.set_takeoff(altitude=TAKEOFF_COMMAND_ALTITUDE_M)
         time.sleep(TAKEOFF_WAIT_S)
         data_link.set_pose(0, 0, TAKEOFF_HOLD_Z_M, 0)  # 起飞后先发送高度目标，保持当前位置附近
         time.sleep(TAKEOFF_HOLD_WAIT_S)

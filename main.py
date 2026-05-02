@@ -5,6 +5,7 @@
 import threading
 import time
 import math
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -26,7 +27,9 @@ from uav_core.color_marker_pose import (
     draw_color_marker_debug,
     estimate_color_marker_pose,
 )
-from uav_core.control_modes import handle_control_mode, keyboard_listener
+from uav_core import control_modes
+from uav_core.codex_flight_log import CodexFlightLogger
+from uav_core.control_modes import get_control_mode_snapshot, handle_control_mode, keyboard_listener
 from uav_core.debug_tools import finish_debug_tools, init_debug_tools
 from uav_core.frame_alignment import FrameAligner
 from uav_core.reference_tracking import (
@@ -48,6 +51,29 @@ UDP_SENDER_ENABLED = True  # 是否启用 UDP 高速图传
 DATALINK_ENABLED = False  # 是否启用飞控通信链路，启用后会根据控制模式发送指令到飞控
 VEHICLE_TCP_ENABLED = False  # 是否启用无人车 TCP 状态接入，默认关闭，避免运行 main.py 时阻塞网络
 COLOR_MARKER_ENABLED = True  # AprilTag 失败时是否启用彩色标记 PnP 备用视觉
+
+# 是否启用 Codex 飞行复盘日志。该日志写入 JSONL 文件，供飞行后诊断视觉/融合/控制链路。
+# 调试建议：默认保持 True；若极限测试主循环耗时，可临时设 False 排除日志开销。
+CODEX_FLIGHT_LOG_ENABLED = True
+
+# Codex 飞行日志目录，使用相对路径时相对于项目根目录。
+# 推荐保持 logs；该目录已加入 .gitignore，避免把飞行数据误提交到 Git。
+CODEX_FLIGHT_LOG_DIR = "logs"
+
+# Codex 飞行日志 sample 采样间隔。sample 会记录视觉、车端、无人机、融合结果和控制量快照。
+# 调大：日志更小、写盘更少；调小：复盘更细，但文件增长更快。
+# 推荐范围：0.1~0.5 s；初始推荐 0.2 s，约 5 Hz。
+CODEX_FLIGHT_LOG_SAMPLE_INTERVAL_S = 0.2
+
+# Codex 飞行日志重复事件最小间隔。带状态值的事件仍会在状态变化时立即记录。
+# 调大：异常重复事件更少；调小：更容易看清短时间内反复触发的保护逻辑。
+# 推荐范围：0.2~2.0 s；初始推荐 0.5 s。
+CODEX_FLIGHT_LOG_EVENT_MIN_INTERVAL_S = 0.5
+
+# Codex 飞行日志刷盘间隔。日志每次写入先进入文件缓冲，超过该间隔会 flush 到磁盘。
+# 调大：写盘更少；调小：意外断电时丢失的最后日志更少。
+# 推荐范围：0.5~3.0 s；初始推荐 1.0 s。
+CODEX_FLIGHT_LOG_FLUSH_INTERVAL_S = 1.0
 
 UDP_RECEIVER_IP = "10.105.26.61"  # UDP 图传接收端 IP 地址，需与接收端设置一致
 UDP_SENDER_QUALITY = 20  # JPEG 压缩质量，范围 0-100，数值越小压缩越强，传输更快但图像质量更差
@@ -332,13 +358,305 @@ def residual_text(tracking_result):
     return f"{residual:.2f}m"
 
 
+def log_float(value, digits=3):
+    """飞行复盘日志用的安全浮点转换。"""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, digits)
+
+
+def log_xy(vec_xy, digits=3):
+    if vec_xy is None:
+        return None
+    arr = np.asarray(vec_xy, dtype=float).reshape(-1)
+    return [log_float(item, digits) for item in arr[:2]]
+
+
+def build_session_config_log(flight_log):
+    """记录一次运行的关键配置，便于飞行后确认当时的开关和调参值。"""
+    return {
+        "git": {
+            "commit": flight_log.git_sha,
+        },
+        "switches": {
+            "debug_mode_enabled": DEBUG_MODE_ENABLED,
+            "udp_sender_enabled": UDP_SENDER_ENABLED,
+            "datalink_enabled": DATALINK_ENABLED,
+            "vehicle_tcp_enabled": VEHICLE_TCP_ENABLED,
+            "color_marker_enabled": COLOR_MARKER_ENABLED,
+        },
+        "codex_flight_log": {
+            "enabled": CODEX_FLIGHT_LOG_ENABLED,
+            "dir": CODEX_FLIGHT_LOG_DIR,
+            "sample_interval_s": CODEX_FLIGHT_LOG_SAMPLE_INTERVAL_S,
+            "event_min_interval_s": CODEX_FLIGHT_LOG_EVENT_MIN_INTERVAL_S,
+            "flush_interval_s": CODEX_FLIGHT_LOG_FLUSH_INTERVAL_S,
+        },
+        "vision": {
+            "tag_forward_axis": TAG_FORWARD_AXIS,
+            "tag_sizes_m": TAG_SIZES,
+            "color_marker_axis_length_m": COLOR_MARKER_AXIS_LENGTH_M,
+        },
+        "yaw_control": {
+            "kp": FORWARD_YAW_KP,
+            "deadband_rad": FORWARD_YAW_DEADBAND_RAD,
+            "max_dyaw_rad": MAX_FORWARD_DYAW_RAD,
+        },
+        "target_estimator": {
+            "alpha": TARGET_ESTIMATOR_ALPHA,
+            "beta": TARGET_ESTIMATOR_BETA,
+            "max_ref_speed_mps": MAX_REF_SPEED_MPS,
+        },
+        "tracking_fusion": dict(TRACKING_FUSION_CONFIG.__dict__),
+        "control_modes": {
+            "arm_wait_s": control_modes.ARM_WAIT_S,
+            "takeoff_command_altitude_m": control_modes.TAKEOFF_COMMAND_ALTITUDE_M,
+            "takeoff_wait_s": control_modes.TAKEOFF_WAIT_S,
+            "takeoff_hold_z_m": control_modes.TAKEOFF_HOLD_Z_M,
+            "takeoff_hold_wait_s": control_modes.TAKEOFF_HOLD_WAIT_S,
+            "land_wait_s": control_modes.LAND_WAIT_S,
+            "track_target_z_m": control_modes.TRACK_TARGET_Z_M,
+            "track_direct_z_enable_below_m": control_modes.TRACK_DIRECT_Z_ENABLE_BELOW_M,
+            "track_lost_grace_s": control_modes.TRACK_LOST_GRACE_S,
+        },
+        "runtime": {
+            "datalink_heartbeat_wait_s": DATALINK_HEARTBEAT_WAIT_S,
+            "tracking_debug_log_interval_frames": TRACKING_DEBUG_LOG_INTERVAL_FRAMES,
+            "vehicle_state_timeout_s": VEHICLE_STATE_TIMEOUT_S,
+            "tag_lost_predict_time_s": TAG_LOST_PREDICT_TIME_S,
+        },
+    }
+
+
+def build_drone_log(data_link):
+    if data_link is None:
+        return None
+    state = data_link.state
+    return {
+        "x": log_float(state.x),
+        "y": log_float(state.y),
+        "z": log_float(state.z),
+        "yaw_deg": log_float(math.degrees(state.yaw), 2),
+        "relative_alt": log_float(state.relative_alt),
+        "battery_voltage": log_float(state.battery_voltage, 2),
+        "heartbeat_count": int(state.heartbeat_count),
+    }
+
+
+def build_vehicle_log(vehicle_state, now):
+    if vehicle_state is None:
+        return {"available": False}
+    return {
+        "available": True,
+        "speed": log_float(vehicle_state.speed),
+        "yaw_deg": log_float(vehicle_state.yaw, 2),
+        "pos_x": log_float(vehicle_state.pos_x),
+        "pos_y": log_float(vehicle_state.pos_y),
+        "pos_z": log_float(vehicle_state.pos_z),
+        "age_s": log_float(now - vehicle_state.timestamp, 3),
+        "action": int(vehicle_state.action),
+    }
+
+
+def build_alignment_log(frame_aligner):
+    return {
+        "initialized": bool(frame_aligner.initialized),
+        "theta_deg": log_float(math.degrees(frame_aligner.theta), 2),
+        "translation_xy": log_xy(frame_aligner.translation),
+    }
+
+
+def build_tracking_log(tracking_result, tracking_frame):
+    if tracking_result is None:
+        return {
+            "source": "NONE",
+            "frame": tracking_frame,
+            "used_vehicle_vel": False,
+            "veh_pose": "off",
+            "residual": None,
+            "fused_vel": None,
+            "ref_xy": None,
+            "future_xy": None,
+        }
+
+    return {
+        "source": tracking_result.source,
+        "frame": tracking_frame,
+        "used_vehicle_vel": bool(tracking_result.used_vehicle_vel),
+        "veh_pose": vehicle_pose_status(tracking_result),
+        "residual": log_float(tracking_result.vehicle_visual_residual_m),
+        "fused_vel": log_xy(tracking_result.fused_vel),
+        "target_xy": log_xy(tracking_result.target_xy),
+        "ref_xy": log_xy(tracking_result.ref_xy),
+        "future_xy": log_xy(tracking_result.future_xy),
+        "used_alignment": bool(tracking_result.used_alignment),
+        "use_prediction": bool(tracking_result.use_prediction),
+    }
+
+
+def build_command_log(control_target_valid, cmd_dx, cmd_dy, cmd_dz, cmd_dyaw):
+    return {
+        "valid": bool(control_target_valid),
+        "dx": log_float(cmd_dx),
+        "dy": log_float(cmd_dy),
+        "dz": log_float(cmd_dz),
+        "dyaw_deg": log_float(math.degrees(cmd_dyaw), 2),
+    }
+
+
+def tracking_source_name(tracking_result):
+    return tracking_result.source if tracking_result is not None else "NONE"
+
+
+def loss_phase_name(vision_source, tracking_source, control_target_valid):
+    if vision_source in ("TAG", "COLOR"):
+        return "visual"
+    if tracking_source == "UGV_POSE":
+        return "ugv_pose"
+    if tracking_source == "PREDICT":
+        return "predict"
+    if control_target_valid:
+        return "valid_no_visual"
+    return "lost_no_target"
+
+
+def record_flight_events(flight_log,
+                         frame_count,
+                         vision_log,
+                         tracking_result,
+                         tracking_frame,
+                         vehicle_state_cache,
+                         vehicle_state,
+                         frame_aligner,
+                         control_target_valid,
+                         mode_snapshot):
+    """只在关键状态变化时写 event，避免飞行日志膨胀。"""
+    tracking_source = tracking_source_name(tracking_result)
+    vehicle_status = "off"
+    if vehicle_state_cache is not None:
+        vehicle_status = "available" if vehicle_state is not None else "timeout"
+
+    flight_log.record_event(
+        "vision_source_change",
+        data={"source": vision_log["source"], "tag_id": vision_log.get("tag_id")},
+        frame=frame_count,
+        dedupe_key="vision_source",
+        value=vision_log["source"],
+    )
+    flight_log.record_event(
+        "tracking_source_change",
+        data={"source": tracking_source, "frame": tracking_frame},
+        frame=frame_count,
+        dedupe_key="tracking_source",
+        value=tracking_source,
+    )
+    flight_log.record_event(
+        "vehicle_state_status",
+        data={"status": vehicle_status},
+        frame=frame_count,
+        dedupe_key="vehicle_state_status",
+        value=vehicle_status,
+    )
+    if frame_aligner.initialized:
+        flight_log.record_event(
+            "alignment_initialized",
+            data=build_alignment_log(frame_aligner),
+            frame=frame_count,
+            dedupe_key="alignment_initialized",
+            value=True,
+        )
+    flight_log.record_event(
+        "control_valid_change",
+        data={"valid": bool(control_target_valid)},
+        frame=frame_count,
+        dedupe_key="control_valid",
+        value=bool(control_target_valid),
+    )
+    flight_log.record_event(
+        "mode_change",
+        data=mode_snapshot,
+        frame=frame_count,
+        dedupe_key="control_mode",
+        value=mode_snapshot["id"],
+    )
+    flight_log.record_event(
+        "loss_phase_change",
+        data={
+            "phase": loss_phase_name(vision_log["source"], tracking_source, control_target_valid),
+            "vision_source": vision_log["source"],
+            "tracking_source": tracking_source,
+        },
+        frame=frame_count,
+        dedupe_key="loss_phase",
+        value=loss_phase_name(vision_log["source"], tracking_source, control_target_valid),
+    )
+
+
+def build_flight_sample(vision_log,
+                        tracking_result,
+                        tracking_frame,
+                        control_target_valid,
+                        cmd_dx,
+                        cmd_dy,
+                        cmd_dz,
+                        cmd_dyaw,
+                        data_link,
+                        vehicle_state,
+                        now,
+                        frame_aligner,
+                        mode_snapshot,
+                        tag_lost_duration):
+    return {
+        "vision": vision_log,
+        "tracking": build_tracking_log(tracking_result, tracking_frame),
+        "command": build_command_log(control_target_valid, cmd_dx, cmd_dy, cmd_dz, cmd_dyaw),
+        "drone": build_drone_log(data_link),
+        "vehicle": build_vehicle_log(vehicle_state, now),
+        "alignment": build_alignment_log(frame_aligner),
+        "mode": mode_snapshot,
+        "tag_lost_duration": log_float(tag_lost_duration, 3),
+    }
+
+
 def main():
+    repo_root = Path(__file__).resolve().parent
+    flight_log = CodexFlightLogger(
+        enabled=CODEX_FLIGHT_LOG_ENABLED,
+        log_dir=CODEX_FLIGHT_LOG_DIR,
+        sample_interval_s=CODEX_FLIGHT_LOG_SAMPLE_INTERVAL_S,
+        event_min_interval_s=CODEX_FLIGHT_LOG_EVENT_MIN_INTERVAL_S,
+        flush_interval_s=CODEX_FLIGHT_LOG_FLUSH_INTERVAL_S,
+        repo_root=repo_root,
+    )
+    flight_log.record_session_config(build_session_config_log(flight_log))
+    flight_log.record_event(
+        "program_start",
+        data={"log_path": flight_log.path},
+        force=True,
+    )
+
     # ---------- 硬件初始化 ----------
     video_capture = init_camera()
     detector = init_detector()
     data_link = None
     if DATALINK_ENABLED:
         data_link = init_datalink()
+    flight_log.record_event(
+        "hardware_initialized",
+        data={
+            "camera": True,
+            "apriltag_detector": True,
+            "datalink_enabled": DATALINK_ENABLED,
+            "datalink_connected": data_link is not None,
+        },
+        force=True,
+    )
 
     # ---------- 启动键盘监听线程 ----------
     threading.Thread(target=keyboard_listener, daemon=True).start()
@@ -357,6 +675,11 @@ def main():
         vehicle_receiver.start()
     else:
         logger.info("无人车 TCP 状态接入关闭，仅使用视觉参考轨迹")
+    flight_log.record_event(
+        "vehicle_tcp_config",
+        data={"enabled": VEHICLE_TCP_ENABLED},
+        force=True,
+    )
 
     # ---------- 调试工具初始化 ----------
     image_dumper, video_converter, udp_sender = init_debug_tools(
@@ -364,9 +687,26 @@ def main():
         UDP_RECEIVER_IP,
         UDP_SENDER_QUALITY,
     )
+    flight_log.record_event(
+        "debug_tools_initialized",
+        data={
+            "debug_mode_enabled": DEBUG_MODE_ENABLED,
+            "udp_sender_enabled": UDP_SENDER_ENABLED,
+            "udp_receiver_ip": UDP_RECEIVER_IP,
+            "udp_quality": UDP_SENDER_QUALITY,
+        },
+        force=True,
+    )
 
     # ---------- 主循环 ----------
     frame_count = 0
+    exit_reason = "normal"
+    last_tracking_state = {
+        "vision_source": "NONE",
+        "tracking_source": "NONE",
+        "mode": get_control_mode_snapshot(),
+        "control_valid": False,
+    }
     last_loop_time = time.time()
     last_visual_detected_time = time.time()  # 记录最后一次视觉观测成功的时间戳，用于计算视觉丢失持续时长
     last_tracking_frame = None
@@ -408,6 +748,12 @@ def main():
             cmd_dx = cmd_dy = cmd_dz = cmd_dyaw = 0  # 默认零指令
             tracking_debug_lines = []
             tracking_result = None
+            vision_log = {
+                "source": "NONE",
+                "tag_id": None,
+                "pnp_xyz": None,
+                "yaw_cmd_deg": None,
+            }
 
             vehicle_state = None
             if vehicle_state_cache is not None:
@@ -431,11 +777,18 @@ def main():
                     last_visual_detected_time = now  # 视觉观测成功，刷新时间戳
 
                     body_xy = pnp_to_body_xy(pnp_x, pnp_y)
-                    cmd_dyaw, _, _ = compute_forward_yaw_cmd(pnp_rvec,
-                                                             tag_forward_axis=TAG_FORWARD_AXIS,
-                                                             kp_yaw=FORWARD_YAW_KP,
-                                                             yaw_deadband=FORWARD_YAW_DEADBAND_RAD,
-                                                             max_dyaw=MAX_FORWARD_DYAW_RAD)
+                    cmd_dyaw, yaw_error_deg, _ = compute_forward_yaw_cmd(pnp_rvec,
+                                                                         tag_forward_axis=TAG_FORWARD_AXIS,
+                                                                         kp_yaw=FORWARD_YAW_KP,
+                                                                         yaw_deadband=FORWARD_YAW_DEADBAND_RAD,
+                                                                         max_dyaw=MAX_FORWARD_DYAW_RAD)
+                    vision_log = {
+                        "source": "TAG",
+                        "tag_id": int(target_tag.tag_id),
+                        "pnp_xyz": [log_float(pnp_x), log_float(pnp_y), log_float(pnp_z)],
+                        "yaw_cmd_deg": log_float(math.degrees(cmd_dyaw), 2),
+                        "yaw_error_deg": log_float(yaw_error_deg, 2),
+                    }
 
                     tracking_frame = get_tracking_frame(data_link)
                     last_tracking_frame = ensure_tracking_frame(
@@ -550,11 +903,18 @@ def main():
                     pnp_x, pnp_y, pnp_z = pnp_tvec.flatten()
 
                     body_xy = pnp_to_body_xy(pnp_x, pnp_y)
-                    cmd_dyaw, _, _ = compute_forward_yaw_cmd(pnp_rvec,
-                                                             tag_forward_axis=TAG_FORWARD_AXIS,
-                                                             kp_yaw=FORWARD_YAW_KP,
-                                                             yaw_deadband=FORWARD_YAW_DEADBAND_RAD,
-                                                             max_dyaw=MAX_FORWARD_DYAW_RAD)
+                    cmd_dyaw, yaw_error_deg, _ = compute_forward_yaw_cmd(pnp_rvec,
+                                                                         tag_forward_axis=TAG_FORWARD_AXIS,
+                                                                         kp_yaw=FORWARD_YAW_KP,
+                                                                         yaw_deadband=FORWARD_YAW_DEADBAND_RAD,
+                                                                         max_dyaw=MAX_FORWARD_DYAW_RAD)
+                    vision_log = {
+                        "source": "COLOR",
+                        "tag_id": None,
+                        "pnp_xyz": [log_float(pnp_x), log_float(pnp_y), log_float(pnp_z)],
+                        "yaw_cmd_deg": log_float(math.degrees(cmd_dyaw), 2),
+                        "yaw_error_deg": log_float(yaw_error_deg, 2),
+                    }
 
                     tracking_frame = get_tracking_frame(data_link)
                     last_tracking_frame = ensure_tracking_frame(
@@ -693,6 +1053,48 @@ def main():
 
             draw_tracking_debug(color_frame, tracking_debug_lines)
 
+            mode_snapshot = get_control_mode_snapshot()
+            record_flight_events(
+                flight_log,
+                frame_count,
+                vision_log,
+                tracking_result,
+                last_tracking_frame,
+                vehicle_state_cache,
+                vehicle_state,
+                frame_aligner,
+                control_target_valid,
+                mode_snapshot,
+            )
+            if flight_log.should_sample(now):
+                flight_log.record_sample(
+                    build_flight_sample(
+                        vision_log,
+                        tracking_result,
+                        last_tracking_frame,
+                        control_target_valid,
+                        cmd_dx,
+                        cmd_dy,
+                        cmd_dz,
+                        cmd_dyaw,
+                        data_link,
+                        vehicle_state,
+                        now,
+                        frame_aligner,
+                        mode_snapshot,
+                        tag_lost_duration,
+                    ),
+                    frame=frame_count,
+                )
+            last_tracking_state = {
+                "vision_source": vision_log["source"],
+                "tracking_source": tracking_source_name(tracking_result),
+                "mode": mode_snapshot,
+                "control_valid": bool(control_target_valid),
+                "tracking_frame": last_tracking_frame,
+                "tag_lost_duration": log_float(tag_lost_duration, 3),
+            }
+
             if DATALINK_ENABLED:
                 handle_control_mode(data_link, control_target_valid, cmd_dx, cmd_dy, cmd_dz, cmd_dyaw, tag_lost_duration)
 
@@ -708,9 +1110,30 @@ def main():
             if DEBUG_MODE_ENABLED:
                 cv2.imshow("AprilTag Detection", color_frame)
                 if 27 == cv2.waitKey(1):
+                    exit_reason = "debug_window_escape"
                     break
 
+    except KeyboardInterrupt:
+        exit_reason = "keyboard_interrupt"
+        logger.info("收到 Ctrl+C，准备退出主循环")
+    except Exception as err:
+        exit_reason = f"exception:{type(err).__name__}"
+        flight_log.record_event(
+            "exception",
+            data={"type": type(err).__name__, "message": str(err)},
+            frame=frame_count,
+            force=True,
+        )
+        raise
     finally:
+        flight_log.close(
+            data={
+                "exit_reason": exit_reason,
+                "frames": frame_count,
+                "last_tracking_state": last_tracking_state,
+            },
+            frame=frame_count,
+        )
         # =========================================================
         # 资源释放
         # =========================================================
