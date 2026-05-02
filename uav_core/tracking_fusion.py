@@ -17,7 +17,17 @@ from uav_core.reference_tracking import (
 
 @dataclass
 class TrackingFusionConfig:
-    """参考轨迹融合参数。"""
+    """
+    参考轨迹融合参数。
+
+    实际调参入口在 main.py 顶部同名常量；这里保留默认值，便于离线假数据测试。
+    参数分为四组：
+    - lookahead/max_cmd：控制参考点预测和飞控水平指令限幅。
+    - vision_vel/vehicle_vel：视觉有效或短时预测时的速度融合权重。
+    - vehicle_pose_fusion：视觉有效时，是否以及何时融合车端绝对位置。
+    - ugv_pose_*：视觉失效后，车端位姿参考点模式的持续时间、速度权重和指令限幅。
+    推荐范围和现场调整方法见 main.py 的“视觉 + 车端位姿融合调参”注释块。
+    """
 
     lookahead_time_s: float = 0.5
     max_cmd_offset_m: float = 1.2
