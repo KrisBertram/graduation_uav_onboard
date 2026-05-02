@@ -61,6 +61,12 @@ TRACK_DIRECT_Z_ENABLE_BELOW_M = 1.8
 # 推荐范围：1~3 s；初始推荐 2 s。
 TRACK_LOST_GRACE_S = 2.0
 
+# 模式 4 等待任务就绪时的提示日志间隔，避免每帧刷屏。
+# 推荐范围：0.5~2.0 s；初始推荐 1.0 s。
+TRACKING_WAIT_LOG_INTERVAL_S = 1.0
+
+_last_tracking_wait_log_time = 0.0
+
 
 def get_control_mode_snapshot():
     """返回当前控制模式快照，供主循环和飞行日志低频采样使用。"""
@@ -97,7 +103,15 @@ def keyboard_listener():
             logger.info("切换模式 → AprilTag 跟踪模式")
 
 
-def handle_control_mode(data_link, control_target_valid, cmd_dx=0, cmd_dy=0, cmd_dz=0, cmd_dyaw=0, tag_lost_duration=0.0):
+def handle_control_mode(data_link,
+                        control_target_valid,
+                        cmd_dx=0,
+                        cmd_dy=0,
+                        cmd_dz=0,
+                        cmd_dyaw=0,
+                        tag_lost_duration=0.0,
+                        tracking_task_ready=True,
+                        tracking_wait_reason=None):
     """
     根据当前控制模式和参考轨迹有效状态，向飞控发送对应指令。
     注意: control_mode 为全局变量，部分模式会在执行后自动切换。
@@ -107,9 +121,9 @@ def handle_control_mode(data_link, control_target_valid, cmd_dx=0, cmd_dy=0, cmd
         1 - 起飞：执行一次起飞序列（解锁 → 起飞 → 爬升），完成后自动切换到模式 3
         2 - 降落：执行一次降落序列（降落 → 加锁），完成后自动切换到模式 0
         3 - 悬停待机：不发任何指令，飞控自行保持位置，可随时从模式 4 跳入此模式作为紧急停止
-        4 - AprilTag 追踪：参考目标有效则发追踪指令；参考目标无效则进入丢失保护
+        4 - AprilTag 追踪：任务门控就绪且参考目标有效则发追踪指令；参考目标无效则进入丢失保护
     """
-    global control_mode
+    global control_mode, _last_tracking_wait_log_time
 
     if control_mode == 0:   # 手动模式，等于空闲模式，什么都不做，等待用户指令
         tag_lost_duration = 0.0  # 在手动模式下，重置 Tag 丢失持续时间，避免切换到跟踪模式后误判为丢失状态
@@ -142,6 +156,14 @@ def handle_control_mode(data_link, control_target_valid, cmd_dx=0, cmd_dy=0, cmd
         pass  # 什么也不发，保持在空中即可
 
     elif control_mode == 4: # AprilTag 跟踪模式
+        if not tracking_task_ready:
+            now = time.time()
+            if now - _last_tracking_wait_log_time >= TRACKING_WAIT_LOG_INTERVAL_S:
+                reason_text = tracking_wait_reason or "WAIT_TASK_READY"
+                logger.info(f"模式 4 等待任务就绪: {reason_text}，保持悬停")
+                _last_tracking_wait_log_time = now
+            return
+
         if control_target_valid == 1:
             local_ignore_z = True  # 默认忽略高度控制，保持当前高度，除非低于 TRACK_DIRECT_Z_ENABLE_BELOW_M
             local_direct_z = False # 默认不直接使用 dz 作为目标高度，低于阈值后才启用 direct_z

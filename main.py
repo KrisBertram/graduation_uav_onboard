@@ -238,6 +238,13 @@ UGV_FALLBACK_MAX_CMD_OFFSET_M = 0.8
 # 该参数会影响 FrameAligner yaw 对齐和车端速度方向，改错会让车端前馈明显变差。
 TAG_FORWARD_AXIS = "+Y"
 
+# 模式 4 是否必须等待首次车机坐标系对齐完成后才允许发送跟踪控制指令。
+# 开启后：进入模式 4 仍继续检测视觉标记和更新 FrameAligner，但 frame_aligner.initialized=True 前不发 set_pose。
+# 关闭后：模式 4 会恢复为只要有视觉/预测目标就可立即发送控制，适合不接车端坐标的纯视觉调试。
+# 推荐：实车任务保持 True；只有确认不需要车端坐标系时才临时设 False。
+TRACKING_REQUIRE_INITIAL_ALIGNMENT = True
+TRACKING_WAIT_FRAME_ALIGNMENT_REASON = "WAIT_FRAME_ALIGNMENT"
+
 TRACKING_FUSION_CONFIG = TrackingFusionConfig(
     lookahead_time_s=LOOKAHEAD_TIME_S,
     max_cmd_offset_m=MAX_CMD_OFFSET_M,
@@ -429,6 +436,7 @@ def build_session_config_log(flight_log):
             "tracking_debug_log_interval_frames": TRACKING_DEBUG_LOG_INTERVAL_FRAMES,
             "vehicle_state_timeout_s": VEHICLE_STATE_TIMEOUT_S,
             "tag_lost_predict_time_s": TAG_LOST_PREDICT_TIME_S,
+            "tracking_require_initial_alignment": TRACKING_REQUIRE_INITIAL_ALIGNMENT,
         },
     }
 
@@ -499,9 +507,35 @@ def build_tracking_log(tracking_result, tracking_frame):
     }
 
 
-def build_command_log(control_target_valid, cmd_dx, cmd_dy, cmd_dz, cmd_dyaw):
+def get_tracking_task_gate(mode_snapshot, frame_aligner):
+    """模式 4 任务门控：首次坐标系对齐完成前，只允许主循环感知和对齐，不允许发跟踪控制。"""
+    if mode_snapshot["id"] != 4:
+        return True, None
+    if not TRACKING_REQUIRE_INITIAL_ALIGNMENT:
+        return True, None
+    if frame_aligner.initialized:
+        return True, None
+    return False, TRACKING_WAIT_FRAME_ALIGNMENT_REASON
+
+
+def command_send_valid(mode_snapshot, control_target_valid, tracking_task_ready):
+    """本帧是否允许把跟踪控制量真正交给模式 4 发送。"""
+    return bool(mode_snapshot["id"] == 4 and control_target_valid and tracking_task_ready)
+
+
+def build_command_log(control_target_valid,
+                      tracking_task_ready,
+                      tracking_wait_reason,
+                      mode_snapshot,
+                      cmd_dx,
+                      cmd_dy,
+                      cmd_dz,
+                      cmd_dyaw):
     return {
-        "valid": bool(control_target_valid),
+        "valid": command_send_valid(mode_snapshot, control_target_valid, tracking_task_ready),
+        "target_valid": bool(control_target_valid),
+        "task_ready": bool(tracking_task_ready),
+        "wait_reason": tracking_wait_reason,
         "dx": log_float(cmd_dx),
         "dy": log_float(cmd_dy),
         "dz": log_float(cmd_dz),
@@ -534,6 +568,8 @@ def record_flight_events(flight_log,
                          vehicle_state,
                          frame_aligner,
                          control_target_valid,
+                         tracking_task_ready,
+                         tracking_wait_reason,
                          mode_snapshot):
     """只在关键状态变化时写 event，避免飞行日志膨胀。"""
     tracking_source = tracking_source_name(tracking_result)
@@ -572,10 +608,25 @@ def record_flight_events(flight_log,
         )
     flight_log.record_event(
         "control_valid_change",
-        data={"valid": bool(control_target_valid)},
+        data={
+            "valid": command_send_valid(mode_snapshot, control_target_valid, tracking_task_ready),
+            "target_valid": bool(control_target_valid),
+            "task_ready": bool(tracking_task_ready),
+        },
         frame=frame_count,
         dedupe_key="control_valid",
-        value=bool(control_target_valid),
+        value=command_send_valid(mode_snapshot, control_target_valid, tracking_task_ready),
+    )
+    flight_log.record_event(
+        "tracking_task_gate_change",
+        data={
+            "ready": bool(tracking_task_ready),
+            "wait_reason": tracking_wait_reason,
+            "alignment": build_alignment_log(frame_aligner),
+        },
+        frame=frame_count,
+        dedupe_key="tracking_task_gate",
+        value=(bool(tracking_task_ready), tracking_wait_reason),
     )
     flight_log.record_event(
         "mode_change",
@@ -610,11 +661,22 @@ def build_flight_sample(vision_log,
                         now,
                         frame_aligner,
                         mode_snapshot,
+                        tracking_task_ready,
+                        tracking_wait_reason,
                         tag_lost_duration):
     return {
         "vision": vision_log,
         "tracking": build_tracking_log(tracking_result, tracking_frame),
-        "command": build_command_log(control_target_valid, cmd_dx, cmd_dy, cmd_dz, cmd_dyaw),
+        "command": build_command_log(
+            control_target_valid,
+            tracking_task_ready,
+            tracking_wait_reason,
+            mode_snapshot,
+            cmd_dx,
+            cmd_dy,
+            cmd_dz,
+            cmd_dyaw,
+        ),
         "drone": build_drone_log(data_link),
         "vehicle": build_vehicle_log(vehicle_state, now),
         "alignment": build_alignment_log(frame_aligner),
@@ -705,6 +767,8 @@ def main():
         "tracking_source": "NONE",
         "mode": get_control_mode_snapshot(),
         "control_valid": False,
+        "tracking_task_ready": True,
+        "tracking_wait_reason": None,
     }
     last_loop_time = time.time()
     last_visual_detected_time = time.time()  # 记录最后一次视觉观测成功的时间戳，用于计算视觉丢失持续时长
@@ -1050,9 +1114,13 @@ def main():
                         f"vel=({tracking_result.fused_vel[0]:+.2f}, {tracking_result.fused_vel[1]:+.2f}) m/s"
                     )
 
+            mode_snapshot = get_control_mode_snapshot()
+            tracking_task_ready, tracking_wait_reason = get_tracking_task_gate(mode_snapshot, frame_aligner)
+            if tracking_wait_reason is not None:
+                tracking_debug_lines.append(f"Task gate {tracking_wait_reason}")
+
             draw_tracking_debug(color_frame, tracking_debug_lines)
 
-            mode_snapshot = get_control_mode_snapshot()
             record_flight_events(
                 flight_log,
                 frame_count,
@@ -1063,6 +1131,8 @@ def main():
                 vehicle_state,
                 frame_aligner,
                 control_target_valid,
+                tracking_task_ready,
+                tracking_wait_reason,
                 mode_snapshot,
             )
             if flight_log.should_sample(now):
@@ -1081,6 +1151,8 @@ def main():
                         now,
                         frame_aligner,
                         mode_snapshot,
+                        tracking_task_ready,
+                        tracking_wait_reason,
                         tag_lost_duration,
                     ),
                     frame=frame_count,
@@ -1090,12 +1162,24 @@ def main():
                 "tracking_source": tracking_source_name(tracking_result),
                 "mode": mode_snapshot,
                 "control_valid": bool(control_target_valid),
+                "tracking_task_ready": bool(tracking_task_ready),
+                "tracking_wait_reason": tracking_wait_reason,
                 "tracking_frame": last_tracking_frame,
                 "tag_lost_duration": log_float(tag_lost_duration, 3),
             }
 
             if DATALINK_ENABLED:
-                handle_control_mode(data_link, control_target_valid, cmd_dx, cmd_dy, cmd_dz, cmd_dyaw, tag_lost_duration)
+                handle_control_mode(
+                    data_link,
+                    control_target_valid,
+                    cmd_dx,
+                    cmd_dy,
+                    cmd_dz,
+                    cmd_dyaw,
+                    tag_lost_duration,
+                    tracking_task_ready=tracking_task_ready,
+                    tracking_wait_reason=tracking_wait_reason,
+                )
 
             # 高速图传
             if UDP_SENDER_ENABLED:
