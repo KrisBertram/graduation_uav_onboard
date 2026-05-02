@@ -37,7 +37,7 @@ from uav_core.reference_tracking import (
 from uav_core.tracking_fusion import TrackingFusionConfig, build_tracking_command
 from uav_core.vehicle_state import VehicleStateReceiver
 from uav_core.visual_control import (
-    compute_yaw_cmd,
+    compute_forward_yaw_cmd,
     estimate_tag_forward_yaw_body,
     pnp_to_body_xy,
 )
@@ -387,11 +387,11 @@ def main():
                     last_visual_detected_time = now  # 视觉观测成功，刷新时间戳
 
                     body_xy = pnp_to_body_xy(pnp_x, pnp_y)
-                    cmd_dyaw, _, _ = compute_yaw_cmd(pnp_rvec,
-                                                     kp_yaw=0.5,
-                                                     yaw_deadband=0.08,
-                                                     max_dyaw=0.6,
-                                                     hysteresis_bonus=0.15)
+                    cmd_dyaw, _, _ = compute_forward_yaw_cmd(pnp_rvec,
+                                                             tag_forward_axis=TAG_FORWARD_AXIS,
+                                                             kp_yaw=0.5,
+                                                             yaw_deadband=0.08,
+                                                             max_dyaw=0.6)
 
                     tracking_frame = get_tracking_frame(data_link)
                     last_tracking_frame = ensure_tracking_frame(
@@ -506,11 +506,11 @@ def main():
                     pnp_x, pnp_y, pnp_z = pnp_tvec.flatten()
 
                     body_xy = pnp_to_body_xy(pnp_x, pnp_y)
-                    cmd_dyaw, _, _ = compute_yaw_cmd(pnp_rvec,
-                                                     kp_yaw=0.5,
-                                                     yaw_deadband=0.08,
-                                                     max_dyaw=0.6,
-                                                     hysteresis_bonus=0.15)
+                    cmd_dyaw, _, _ = compute_forward_yaw_cmd(pnp_rvec,
+                                                             tag_forward_axis=TAG_FORWARD_AXIS,
+                                                             kp_yaw=0.5,
+                                                             yaw_deadband=0.08,
+                                                             max_dyaw=0.6)
 
                     tracking_frame = get_tracking_frame(data_link)
                     last_tracking_frame = ensure_tracking_frame(
