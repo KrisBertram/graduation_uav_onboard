@@ -33,9 +33,8 @@ from uav_core.reference_tracking import (
     ReferenceTrajectory,
     TargetEstimator,
     body_to_local_xy,
-    clamp_norm,
-    local_to_body_xy,
 )
+from uav_core.tracking_fusion import TrackingFusionConfig, build_tracking_command
 from uav_core.vehicle_state import VehicleStateReceiver
 from uav_core.visual_control import (
     compute_yaw_cmd,
@@ -62,7 +61,34 @@ ALIGN_YAW_ALPHA = 0.05  # 坐标系 yaw 在线修正低通系数
 ALIGN_POS_ALPHA = 0.05  # 坐标系平移在线修正低通系数
 VISION_VEL_WEIGHT = 0.4  # 视觉估速权重
 VEHICLE_VEL_WEIGHT = 0.6  # 车端速度前馈权重
+VEHICLE_POSE_FUSION_ENABLED = True  # 视觉有效时是否融合车端位置参考
+VEHICLE_POSE_FALLBACK_ENABLED = True  # 视觉失效时是否允许车端位姿接管参考点
+UGV_POSE_FALLBACK_MAX_S = 5.0  # 距离上次视觉成功超过该时间后，不再单独使用车端位姿接管
+UGV_VISUAL_FUSE_MAX_RESIDUAL_M = 0.25  # 视觉与车端位置残差小于该值时融合车端位置
+UGV_VISUAL_REJECT_RESIDUAL_M = 0.60  # 视觉与车端位置残差大于该值时拒绝车端位置融合
+TAG_VISUAL_POS_WEIGHT = 0.85  # AprilTag 视觉位置融合权重
+COLOR_VISUAL_POS_WEIGHT = 0.70  # 彩色 PnP 视觉位置融合权重
+UGV_POSE_EST_VEL_WEIGHT = 0.2  # 车端位姿 fallback 中估计器速度权重
+UGV_POSE_VEL_WEIGHT = 0.8  # 车端位姿 fallback 中车端速度权重
+UGV_FALLBACK_MAX_CMD_OFFSET_M = 0.8  # 车端位姿 fallback 阶段水平指令限幅
 TAG_FORWARD_AXIS = "+Y"  # 默认 Tag +Y 方向与无人车车头方向一致
+
+TRACKING_FUSION_CONFIG = TrackingFusionConfig(
+    lookahead_time_s=LOOKAHEAD_TIME_S,
+    max_cmd_offset_m=MAX_CMD_OFFSET_M,
+    vision_vel_weight=VISION_VEL_WEIGHT,
+    vehicle_vel_weight=VEHICLE_VEL_WEIGHT,
+    vehicle_pose_fusion_enabled=VEHICLE_POSE_FUSION_ENABLED,
+    vehicle_pose_fallback_enabled=VEHICLE_POSE_FALLBACK_ENABLED,
+    ugv_pose_fallback_max_s=UGV_POSE_FALLBACK_MAX_S,
+    ugv_visual_fuse_max_residual_m=UGV_VISUAL_FUSE_MAX_RESIDUAL_M,
+    ugv_visual_reject_residual_m=UGV_VISUAL_REJECT_RESIDUAL_M,
+    tag_visual_pos_weight=TAG_VISUAL_POS_WEIGHT,
+    color_visual_pos_weight=COLOR_VISUAL_POS_WEIGHT,
+    ugv_pose_est_vel_weight=UGV_POSE_EST_VEL_WEIGHT,
+    ugv_pose_vel_weight=UGV_POSE_VEL_WEIGHT,
+    ugv_fallback_max_cmd_offset_m=UGV_FALLBACK_MAX_CMD_OFFSET_M,
+)
 
 
 def init_datalink():
@@ -126,98 +152,45 @@ def draw_tracking_debug(color_frame, debug_lines):
         y += 24
 
 
-def build_tracking_command(
-    *,
-    now,
-    dt,
-    tracking_frame,
-    target_estimator,
-    reference_traj,
-    body_xy=None,
-    data_link=None,
-    vehicle_state=None,
-    frame_aligner=None,
-    pnp_rvec=None,
-    use_prediction=False,
-):
-    """
-    由视觉测量/预测状态生成机体系水平控制量。
+def get_tracking_frame(data_link):
+    """根据飞控状态选择参考轨迹所在坐标系。"""
+    return "local" if (DATALINK_ENABLED and drone_state_valid(data_link)) else "body"
 
-    tracking_frame == "local" 时，估计器状态在无人机局部坐标系；
-    tracking_frame == "body" 时，估计器状态直接在机体系水平平面。
-    """
-    vehicle_vel = None
-    used_alignment = False
-    target_xy = None
 
-    if tracking_frame == "local":
-        drone_xy = get_drone_xy(data_link)
-        drone_yaw = data_link.state.yaw
+def ensure_tracking_frame(tracking_frame, last_tracking_frame, target_estimator, reference_traj):
+    """坐标系切换时重置估计器，避免 body/local 状态混用。"""
+    if tracking_frame != last_tracking_frame:
+        target_estimator.reset()
+        reference_traj.reset()
+        logger.info(f"参考轨迹坐标系切换为: {tracking_frame}")
+        return tracking_frame
+    return last_tracking_frame
 
-        if body_xy is not None:
-            target_xy = drone_xy + body_to_local_xy(body_xy, drone_yaw)
 
-            if vehicle_state is not None:
-                tag_yaw_drone = tag_yaw_to_drone_yaw(pnp_rvec, drone_yaw)
-                vehicle_xy = np.array([vehicle_state.pos_x, vehicle_state.pos_y], dtype=float)
-                frame_aligner.update(
-                    vehicle_xy,
-                    vehicle_state.yaw_rad,
-                    target_xy,
-                    tag_yaw_drone,
-                )
+def get_tracking_drone_state(data_link, tracking_frame):
+    """local 跟踪需要无人机局部位置和 yaw；body 跟踪不需要。"""
+    if tracking_frame != "local":
+        return None, None
+    return get_drone_xy(data_link), data_link.state.yaw
 
-            target_estimator.update_measurement(target_xy, now)
 
-        if vehicle_state is not None and frame_aligner is not None and frame_aligner.initialized:
-            vehicle_vel = frame_aligner.vehicle_velocity_to_drone(
-                vehicle_state.speed,
-                vehicle_state.yaw_rad,
-            )
-            used_alignment = True
+def vehicle_pose_status(tracking_result):
+    """把融合结果转换成调试显示用的车端位置状态。"""
+    if tracking_result.source == "UGV_POSE":
+        return "fallback"
+    if tracking_result.fused_vehicle_pose:
+        return "fused"
+    residual = tracking_result.vehicle_visual_residual_m
+    if residual is not None and residual > TRACKING_FUSION_CONFIG.ugv_visual_reject_residual_m:
+        return "rejected"
+    return "off"
 
-        future_xy, fused_vel, used_vehicle = target_estimator.make_future_point(
-            now,
-            LOOKAHEAD_TIME_S,
-            vehicle_vel_xy=vehicle_vel,
-            vision_weight=VISION_VEL_WEIGHT,
-            vehicle_weight=VEHICLE_VEL_WEIGHT,
-        )
-        if future_xy is None:
-            return None
 
-        ref_xy = reference_traj.update(future_xy, dt)
-        cmd_local = clamp_norm(ref_xy - drone_xy, MAX_CMD_OFFSET_M)
-        cmd_body = local_to_body_xy(cmd_local, drone_yaw)
-
-    else:
-        if body_xy is not None:
-            target_estimator.update_measurement(body_xy, now)
-
-        future_xy, fused_vel, used_vehicle = target_estimator.make_future_point(
-            now,
-            LOOKAHEAD_TIME_S,
-            vehicle_vel_xy=None,
-            vision_weight=VISION_VEL_WEIGHT,
-            vehicle_weight=VEHICLE_VEL_WEIGHT,
-        )
-        if future_xy is None:
-            return None
-
-        ref_xy = reference_traj.update(future_xy, dt)
-        cmd_body = clamp_norm(ref_xy, MAX_CMD_OFFSET_M)
-        target_xy = body_xy
-
-    return {
-        "cmd_body": cmd_body,
-        "target_xy": target_xy,
-        "ref_xy": ref_xy,
-        "future_xy": future_xy,
-        "fused_vel": fused_vel,
-        "used_vehicle": used_vehicle,
-        "used_alignment": used_alignment,
-        "use_prediction": use_prediction,
-    }
+def residual_text(tracking_result):
+    residual = tracking_result.vehicle_visual_residual_m
+    if residual is None:
+        return "n/a"
+    return f"{residual:.2f}m"
 
 
 def main():
@@ -256,7 +229,7 @@ def main():
     # ---------- 主循环 ----------
     frame_count = 0
     last_loop_time = time.time()
-    last_tag_detected_time = time.time()  # 记录最后一次成功检测到目标 Tag 的时间戳，用于计算丢失持续时长
+    last_visual_detected_time = time.time()  # 记录最后一次视觉观测成功的时间戳，用于计算视觉丢失持续时长
     last_tracking_frame = None
     target_estimator = TargetEstimator()
     reference_traj = ReferenceTrajectory(max_speed_mps=MAX_REF_SPEED_MPS)
@@ -293,7 +266,6 @@ def main():
             cmd_dx = cmd_dy = cmd_dz = cmd_dyaw = 0  # 默认零指令
             tracking_debug_lines = []
             tracking_result = None
-            tracking_source = None
 
             vehicle_state = None
             if vehicle_state_cache is not None:
@@ -314,8 +286,7 @@ def main():
                 pnp_ok, pnp_rvec, pnp_tvec, pnp_x, pnp_y, pnp_z, image_points = estimate_pose(target_tag, target_tag_size)
                 if pnp_ok:
                     tag_detected = 1
-                    tracking_source = "TAG"
-                    last_tag_detected_time = now  # 检测成功，刷新时间戳
+                    last_visual_detected_time = now  # 视觉观测成功，刷新时间戳
 
                     body_xy = pnp_to_body_xy(pnp_x, pnp_y)
                     cmd_dyaw, _, _ = compute_yaw_cmd(pnp_rvec,
@@ -324,12 +295,19 @@ def main():
                                                      max_dyaw=0.6,
                                                      hysteresis_bonus=0.15)
 
-                    tracking_frame = "local" if (DATALINK_ENABLED and drone_state_valid(data_link)) else "body"
-                    if tracking_frame != last_tracking_frame:
-                        target_estimator.reset()
-                        reference_traj.reset()
-                        last_tracking_frame = tracking_frame
-                        logger.info(f"参考轨迹坐标系切换为: {tracking_frame}")
+                    tracking_frame = get_tracking_frame(data_link)
+                    last_tracking_frame = ensure_tracking_frame(
+                        tracking_frame,
+                        last_tracking_frame,
+                        target_estimator,
+                        reference_traj,
+                    )
+                    drone_xy, drone_yaw = get_tracking_drone_state(data_link, tracking_frame)
+                    tag_yaw_drone = (
+                        tag_yaw_to_drone_yaw(pnp_rvec, drone_yaw)
+                        if tracking_frame == "local"
+                        else None
+                    )
 
                     tracking_result = build_tracking_command(
                         now=now,
@@ -337,16 +315,19 @@ def main():
                         tracking_frame=tracking_frame,
                         target_estimator=target_estimator,
                         reference_traj=reference_traj,
+                        config=TRACKING_FUSION_CONFIG,
                         body_xy=body_xy,
-                        data_link=data_link,
+                        drone_xy=drone_xy,
+                        drone_yaw=drone_yaw,
                         vehicle_state=vehicle_state,
                         frame_aligner=frame_aligner,
-                        pnp_rvec=pnp_rvec,
+                        tag_yaw_drone=tag_yaw_drone,
+                        visual_source="TAG",
                         use_prediction=False,
                     )
 
                     if tracking_result is not None:
-                        cmd_body = tracking_result["cmd_body"]
+                        cmd_body = tracking_result.cmd_body
                         cmd_dx = float(cmd_body[0])
                         cmd_dy = float(cmd_body[1])
                         control_target_valid = 1
@@ -420,8 +401,7 @@ def main():
 
                 if color_observation is not None:
                     tag_detected = 1
-                    tracking_source = "COLOR"
-                    last_tag_detected_time = now  # 彩色 PnP 成功，也视为有效视觉观测
+                    last_visual_detected_time = now  # 彩色 PnP 成功，也视为有效视觉观测
 
                     pnp_rvec = color_observation.rvec
                     pnp_tvec = color_observation.tvec
@@ -434,12 +414,19 @@ def main():
                                                      max_dyaw=0.6,
                                                      hysteresis_bonus=0.15)
 
-                    tracking_frame = "local" if (DATALINK_ENABLED and drone_state_valid(data_link)) else "body"
-                    if tracking_frame != last_tracking_frame:
-                        target_estimator.reset()
-                        reference_traj.reset()
-                        last_tracking_frame = tracking_frame
-                        logger.info(f"参考轨迹坐标系切换为: {tracking_frame}")
+                    tracking_frame = get_tracking_frame(data_link)
+                    last_tracking_frame = ensure_tracking_frame(
+                        tracking_frame,
+                        last_tracking_frame,
+                        target_estimator,
+                        reference_traj,
+                    )
+                    drone_xy, drone_yaw = get_tracking_drone_state(data_link, tracking_frame)
+                    tag_yaw_drone = (
+                        tag_yaw_to_drone_yaw(pnp_rvec, drone_yaw)
+                        if tracking_frame == "local"
+                        else None
+                    )
 
                     tracking_result = build_tracking_command(
                         now=now,
@@ -447,16 +434,19 @@ def main():
                         tracking_frame=tracking_frame,
                         target_estimator=target_estimator,
                         reference_traj=reference_traj,
+                        config=TRACKING_FUSION_CONFIG,
                         body_xy=body_xy,
-                        data_link=data_link,
+                        drone_xy=drone_xy,
+                        drone_yaw=drone_yaw,
                         vehicle_state=vehicle_state,
                         frame_aligner=frame_aligner,
-                        pnp_rvec=pnp_rvec,
+                        tag_yaw_drone=tag_yaw_drone,
+                        visual_source="COLOR",
                         use_prediction=False,
                     )
 
                     if tracking_result is not None:
-                        cmd_body = tracking_result["cmd_body"]
+                        cmd_body = tracking_result.cmd_body
                         cmd_dx = float(cmd_body[0])
                         cmd_dy = float(cmd_body[1])
                         control_target_valid = 1
@@ -481,47 +471,82 @@ def main():
                     )
 
             # ---------- 控制模式分发 ----------
-            tag_lost_duration = now - last_tag_detected_time  # 计算自上次检测到目标 Tag 以来已经过去了多少秒
+            tag_lost_duration = now - last_visual_detected_time  # 计算自上次视觉观测成功以来已经过去了多少秒
 
-            if tag_detected == 0 and tag_lost_duration < TAG_LOST_PREDICT_TIME_S:
-                tracking_frame = "local" if (DATALINK_ENABLED and drone_state_valid(data_link)) else "body"
-                if tracking_frame == last_tracking_frame and target_estimator.initialized:
+            if tag_detected == 0:
+                tracking_frame = get_tracking_frame(data_link)
+                last_tracking_frame = ensure_tracking_frame(
+                    tracking_frame,
+                    last_tracking_frame,
+                    target_estimator,
+                    reference_traj,
+                )
+                drone_xy, drone_yaw = get_tracking_drone_state(data_link, tracking_frame)
+
+                # 视觉失效时优先尝试车端位姿参考点；只有不可用时才退回短时预测。
+                tracking_result = build_tracking_command(
+                    now=now,
+                    dt=dt,
+                    tracking_frame=tracking_frame,
+                    target_estimator=target_estimator,
+                    reference_traj=reference_traj,
+                    config=TRACKING_FUSION_CONFIG,
+                    body_xy=None,
+                    drone_xy=drone_xy,
+                    drone_yaw=drone_yaw,
+                    vehicle_state=vehicle_state,
+                    frame_aligner=frame_aligner,
+                    use_vehicle_pose_fallback=True,
+                    last_visual_time=last_visual_detected_time,
+                )
+
+                if tracking_result is not None:
+                    cmd_body = tracking_result.cmd_body
+                    cmd_dx = float(cmd_body[0])
+                    cmd_dy = float(cmd_body[1])
+                    cmd_dyaw = 0.0
+                    control_target_valid = 1
+
+                elif tag_lost_duration < TAG_LOST_PREDICT_TIME_S:
                     tracking_result = build_tracking_command(
                         now=now,
                         dt=dt,
                         tracking_frame=tracking_frame,
                         target_estimator=target_estimator,
                         reference_traj=reference_traj,
+                        config=TRACKING_FUSION_CONFIG,
                         body_xy=None,
-                        data_link=data_link,
+                        drone_xy=drone_xy,
+                        drone_yaw=drone_yaw,
                         vehicle_state=vehicle_state,
                         frame_aligner=frame_aligner,
-                        pnp_rvec=None,
                         use_prediction=True,
                     )
 
                     if tracking_result is not None:
-                        cmd_body = tracking_result["cmd_body"]
+                        cmd_body = tracking_result.cmd_body
                         cmd_dx = float(cmd_body[0])
                         cmd_dy = float(cmd_body[1])
                         cmd_dyaw = 0.0
                         control_target_valid = 1
 
             if tracking_result is not None:
-                mode_text = "PRED" if tracking_result["use_prediction"] else (tracking_source or "TAG")
-                veh_text = "veh=on" if tracking_result["used_vehicle"] else "veh=off"
+                source_text = tracking_result.source
+                veh_vel_text = "veh_vel=on" if tracking_result.used_vehicle_vel else "veh_vel=off"
+                veh_pose_text = f"veh_pose={vehicle_pose_status(tracking_result)}"
+                residual_info = f"residual={residual_text(tracking_result)}"
                 frame_text = f"frame={last_tracking_frame}"
                 tracking_debug_lines = [
-                    f"Ref {mode_text} {frame_text} {veh_text}",
+                    f"Ref {source_text} {frame_text} {veh_vel_text} {veh_pose_text}",
                     f"cmd body dx={cmd_dx:+.2f} dy={cmd_dy:+.2f} yaw={math.degrees(cmd_dyaw):+.1f}deg",
-                    f"vel=({tracking_result['fused_vel'][0]:+.2f},{tracking_result['fused_vel'][1]:+.2f}) m/s",
+                    f"vel=({tracking_result.fused_vel[0]:+.2f},{tracking_result.fused_vel[1]:+.2f}) m/s {residual_info}",
                 ]
 
                 if frame_count % 15 == 0:
                     logger.debug(
-                        f"[RefTrack] {mode_text} {frame_text} {veh_text} | "
+                        f"[RefTrack] {source_text} {frame_text} {veh_vel_text} {veh_pose_text} {residual_info} | "
                         f"cmd=({cmd_dx:+.2f}, {cmd_dy:+.2f}) m | "
-                        f"vel=({tracking_result['fused_vel'][0]:+.2f}, {tracking_result['fused_vel'][1]:+.2f}) m/s"
+                        f"vel=({tracking_result.fused_vel[0]:+.2f}, {tracking_result.fused_vel[1]:+.2f}) m/s"
                     )
 
             draw_tracking_debug(color_frame, tracking_debug_lines)
