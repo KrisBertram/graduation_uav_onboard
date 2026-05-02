@@ -9,6 +9,25 @@ import numpy as np
 from loguru import logger
 
 
+# ---------- 视觉控制默认调参 ----------
+# main.py 会显式传入主链路参数；这里的默认值用于单独调用本模块函数或旧测试脚本。
+
+# Tag/车辆前向偏航比例增益。调大响应更快但更容易抖，推荐 0.3~0.8。
+DEFAULT_FORWARD_YAW_KP = 0.5
+
+# Tag/车辆前向偏航死区，单位 rad。调大更稳但允许残余误差，推荐 0.04~0.12 rad。
+DEFAULT_FORWARD_YAW_DEADBAND_RAD = 0.08
+
+# Tag/车辆前向偏航指令限幅，单位 rad。调大修正更快但更激进，推荐 0.3~0.8 rad。
+DEFAULT_MAX_FORWARD_DYAW_RAD = 0.6
+
+# compute_control_cmd() 旧接口中的平移比例增益；当前主链路主要使用参考轨迹，不直接用它。
+# 调大响应更快但更容易超调，调小更平滑但跟踪偏差收敛慢，推荐 0.4~0.8。
+DEFAULT_TRANSLATION_KP_X = 0.6
+DEFAULT_TRANSLATION_KP_Y = 0.6
+DEFAULT_TRANSLATION_KP_Z = 0.6
+
+
 def pnp_to_body_xy(pnp_x, pnp_y):
     """
     将 PnP 相机系水平平移转换为机体系水平位置。
@@ -53,9 +72,9 @@ def estimate_tag_forward_yaw_body(pnp_rvec, tag_forward_axis="+Y"):
 
 def compute_forward_yaw_cmd(pnp_rvec,
                             tag_forward_axis="+Y",
-                            kp_yaw=0.5,
-                            yaw_deadband=0.08,
-                            max_dyaw=0.6):
+                            kp_yaw=DEFAULT_FORWARD_YAW_KP,
+                            yaw_deadband=DEFAULT_FORWARD_YAW_DEADBAND_RAD,
+                            max_dyaw=DEFAULT_MAX_FORWARD_DYAW_RAD):
     """
     利用 solvePnP 解算出的旋转向量 rvec，让无人机机头对齐 Tag/车辆前向轴。
 
@@ -113,10 +132,10 @@ def compute_control_cmd(pnp_x, pnp_y, pnp_z, pnp_rvec):
     # =========================
     # 控制器参数（平移）
     # =========================
-    kp_x = 0.6
-    kp_y = 0.6
-    kp_z = 0.6
-    kp_yaw = 0.5  # v4: 新增偏航控制增益
+    kp_x = DEFAULT_TRANSLATION_KP_X
+    kp_y = DEFAULT_TRANSLATION_KP_Y
+    kp_z = DEFAULT_TRANSLATION_KP_Z
+    kp_yaw = DEFAULT_FORWARD_YAW_KP
 
     cmd_dx = kp_x * body_dx
     cmd_dy = kp_y * body_dy
@@ -128,7 +147,7 @@ def compute_control_cmd(pnp_x, pnp_y, pnp_z, pnp_rvec):
     cmd_dyaw, _, _ = compute_forward_yaw_cmd(pnp_rvec,
                                              tag_forward_axis="+Y",
                                              kp_yaw=kp_yaw,
-                                             yaw_deadband=0.08,
-                                             max_dyaw=0.6)
+                                             yaw_deadband=DEFAULT_FORWARD_YAW_DEADBAND_RAD,
+                                             max_dyaw=DEFAULT_MAX_FORWARD_DYAW_RAD)
 
     return cmd_dx, cmd_dy, cmd_dz, cmd_dyaw
