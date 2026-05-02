@@ -25,11 +25,6 @@ CONTROL_MODE_NAMES = {
 # 推荐范围：0.5~2.0 s；初始推荐 1.0 s。
 ARM_WAIT_S = 1.0
 
-# 起飞指令高度参数：传给 data_link.set_takeoff() 的 altitude 字段。
-# 当前主链路实际爬升高度由 TAKEOFF_HOLD_Z_M 的 set_pose 目标控制，因此这里保持 0.0 不变。
-# 调整前必须确认飞控 set_takeoff() 对 altitude 的具体解释；不确认时推荐保持 0.0。
-TAKEOFF_COMMAND_ALTITUDE_M = 0.0
-
 # 起飞指令后等待时间：等待飞控完成起飞初始动作，再发送后续高度/位置目标。
 # 调大：更保守；调小：可能过早覆盖起飞目标。
 # 推荐范围：3~6 s；初始推荐 4 s。
@@ -124,7 +119,7 @@ def handle_control_mode(data_link, control_target_valid, cmd_dx=0, cmd_dy=0, cmd
         logger.info("收到指令：解锁电机并起飞")
         data_link.set_arm()
         time.sleep(ARM_WAIT_S)
-        data_link.set_takeoff(altitude=TAKEOFF_COMMAND_ALTITUDE_M)
+        data_link.set_takeoff(altitude=0)
         time.sleep(TAKEOFF_WAIT_S)
         data_link.set_pose(0, 0, TAKEOFF_HOLD_Z_M, 0)  # 起飞后先发送高度目标，保持当前位置附近
         time.sleep(TAKEOFF_HOLD_WAIT_S)

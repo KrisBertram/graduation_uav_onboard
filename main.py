@@ -63,12 +63,12 @@ CODEX_FLIGHT_LOG_DIR = "logs"
 # Codex 飞行日志 sample 采样间隔。sample 会记录视觉、车端、无人机、融合结果和控制量快照。
 # 调大：日志更小、写盘更少；调小：复盘更细，但文件增长更快。
 # 推荐范围：0.1~0.5 s；初始推荐 0.2 s，约 5 Hz。
-CODEX_FLIGHT_LOG_SAMPLE_INTERVAL_S = 0.2
+CODEX_FLIGHT_LOG_SAMPLE_INTERVAL_S = 0.5
 
 # Codex 飞行日志重复事件最小间隔。带状态值的事件仍会在状态变化时立即记录。
 # 调大：异常重复事件更少；调小：更容易看清短时间内反复触发的保护逻辑。
 # 推荐范围：0.2~2.0 s；初始推荐 0.5 s。
-CODEX_FLIGHT_LOG_EVENT_MIN_INTERVAL_S = 0.5
+CODEX_FLIGHT_LOG_EVENT_MIN_INTERVAL_S = 0.8
 
 # Codex 飞行日志刷盘间隔。日志每次写入先进入文件缓冲，超过该间隔会 flush 到磁盘。
 # 调大：写盘更少；调小：意外断电时丢失的最后日志更少。
@@ -416,7 +416,6 @@ def build_session_config_log(flight_log):
         "tracking_fusion": dict(TRACKING_FUSION_CONFIG.__dict__),
         "control_modes": {
             "arm_wait_s": control_modes.ARM_WAIT_S,
-            "takeoff_command_altitude_m": control_modes.TAKEOFF_COMMAND_ALTITUDE_M,
             "takeoff_wait_s": control_modes.TAKEOFF_WAIT_S,
             "takeoff_hold_z_m": control_modes.TAKEOFF_HOLD_Z_M,
             "takeoff_hold_wait_s": control_modes.TAKEOFF_HOLD_WAIT_S,
