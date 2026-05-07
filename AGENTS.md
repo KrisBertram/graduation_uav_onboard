@@ -36,7 +36,7 @@
   - 负责主循环编排、功能开关、DataLink 初始化、车端 TCP 状态接入、视觉/车端融合、Codex 飞行日志和资源释放。
   - 运行方式为 `python main.py`。
   - 当前关键功能开关包括 `DEBUG_MODE_ENABLED`、`UDP_SENDER_ENABLED`、`DATALINK_ENABLED`、`VEHICLE_TCP_ENABLED`、`COLOR_MARKER_ENABLED`、`CODEX_FLIGHT_LOG_ENABLED`、`TRACKING_REQUIRE_INITIAL_ALIGNMENT`。
-  - `main.py` 顶部也集中放置视觉偏航、目标估计、视觉/车端融合、UGV fallback、日志采样和模式 4 对齐门控等调参常量；实测前必须检查这些值和未提交 diff。
+  - `main.py` 顶部也集中放置视觉偏航、目标估计、视觉/车端融合、UGV fallback、日志采样和模式 4 对齐门控等调参常量。
   - `DATALINK_ENABLED=False` 时不应假设飞控指令真的发送。
   - `DATALINK_ENABLED=True` 且控制模式进入 4 时，才会通过 `handle_control_mode()` 把主循环生成的控制目标交给飞控；模式 4 默认还要求首次坐标系对齐完成。
 
@@ -97,7 +97,7 @@
 
 - `logs/`
   - Codex 飞行复盘日志输出目录，已加入 `.gitignore`。
-  - 每次运行 `main.py` 且 `CODEX_FLIGHT_LOG_ENABLED=True` 时会生成一个 JSONL 文件；飞行后分析问题时可优先查看这里的最新日志。
+  - 每次运行 `main.py` 且 `CODEX_FLIGHT_LOG_ENABLED=True` 时会生成一个 JSONL 文件；平时可忽略该目录，除非用户飞行后明确要求查看这里的最新日志并分析问题。
 
 - `temp/`
   - 已过期或废弃文件，通常没有参考价值，默认不要阅读或改动。
@@ -205,7 +205,6 @@
 - 无人车端协议参考仓库已放在 `reference/graduation_ugv_firmware/`；对接车机 TCP 数据包时，以该仓库的 `docs/vehicle_drone_protocol.md` 和 `code/wifi_packet.c/.h` 为准。
 - 修改 MAVLink 发送逻辑前，先确认坐标系、单位、`type_mask`、飞控期望的 frame，以及当前飞控状态来源是否有效。
 - 修改图传逻辑时，保持 UDP 包头格式和接收端一致；`FRAG_DATA_SIZE` 变更会影响链路丢包和延迟。
-- 飞行后问题复盘优先结合现场视频、控制台日志和 `logs/flight_*.jsonl`；Codex 日志比控制台日志更适合分析 source 切换、残差、模式门控、车端状态超时和控制量变化。
 - 不要把 `image_output/` 中的图片/视频作为代码上下文，除非用户明确要求分析某次飞行记录。
 - 不要把 `logs/` 中的飞行日志提交到 Git；需要分析时由用户明确指定具体日志文件或时间段。
 - 不要基于 `temp/` 中内容推断当前实现，除非用户明确要求追溯历史方案。
