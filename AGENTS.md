@@ -6,7 +6,7 @@
 
 这是毕业设计《车载无人机的自主跟踪与降落方法研究》中的无人机端机载电脑代码。机载电脑为 Jetson Orin NX；无人机飞控为现成飞控，不能修改飞控端代码。整体目标是：无人车按照预设轨迹自主行驶，无人机自主跟踪无人车，并降落在无人车平台上。车机之间通过 WiFi + TCP 通信，共享位姿、轨迹等信息；机载电脑与飞控之间通过 MAVLink 串口通信。
 
-当前仓库已逐步整理为以 `main.py` 为主入口的无人机端主链路工程，视觉检测、车机通信、参考轨迹跟踪、飞控控制和调试工具均围绕该结构继续开发；后续开发也将继续围绕现有工程结构推进；`test/` 目录主要保留独立功能验证、离线调参和辅助生成脚本。
+当前仓库已逐步整理为以 `main.py` 为主入口的无人机端主链路工程，视觉检测、车机通信、视觉与车端位姿融合、参考轨迹跟踪、飞控控制、飞行复盘日志和调试工具均围绕该结构继续开发；后续开发也将继续围绕现有工程结构推进；`test/` 目录主要保留独立功能验证、离线调参和辅助生成脚本。
 
 ## 阅读与编码要求
 
@@ -33,21 +33,25 @@
 
 - `main.py`
   - 当前视觉跟踪/飞控联调主入口。
-  - 负责主循环编排、功能开关、DataLink 初始化和资源释放。
+  - 负责主循环编排、功能开关、DataLink 初始化、车端 TCP 状态接入、视觉/车端融合、Codex 飞行日志和资源释放。
   - 运行方式为 `python main.py`。
-  - 当前关键功能开关包括 `DEBUG_MODE_ENABLED`、`UDP_SENDER_ENABLED`、`DATALINK_ENABLED`、`VEHICLE_TCP_ENABLED`、`COLOR_MARKER_ENABLED`。
+  - 当前关键功能开关包括 `DEBUG_MODE_ENABLED`、`UDP_SENDER_ENABLED`、`DATALINK_ENABLED`、`VEHICLE_TCP_ENABLED`、`COLOR_MARKER_ENABLED`、`CODEX_FLIGHT_LOG_ENABLED`、`TRACKING_REQUIRE_INITIAL_ALIGNMENT`。
+  - `main.py` 顶部也集中放置视觉偏航、目标估计、视觉/车端融合、UGV fallback、日志采样和模式 4 对齐门控等调参常量；实测前必须检查这些值和未提交 diff。
   - `DATALINK_ENABLED=False` 时不应假设飞控指令真的发送。
+  - `DATALINK_ENABLED=True` 且控制模式进入 4 时，才会通过 `handle_control_mode()` 把主循环生成的控制目标交给飞控；模式 4 默认还要求首次坐标系对齐完成。
 
 - `uav_core/`
   - 无人机端核心功能包，承载视觉跟踪、控制模式和调试工具等可复用逻辑。
   - `camera.py`：Jetson CSI 摄像头 GStreamer 管线和相机初始化。
   - `apriltag_pose.py`：相机内参、AprilTag 参数、目标 Tag 选择、PnP 位姿解算。
-  - `visual_control.py`：相机坐标到机体系映射、Tag 前向估计、偏航对齐。
+  - `visual_control.py`：相机坐标到机体系映射、Tag 前向估计、让无人机机头跟随 Tag/车辆前向轴的偏航控制。
   - `color_marker_pose.py`：AprilTag 失效时的彩色标记检测与 PnP 备用位姿解算。
   - `reference_tracking.py`：目标状态估计、车端速度前馈融合、前视点预测、参考点限速平滑。
+  - `tracking_fusion.py`：统一生成 `TAG_FUSED`/`COLOR_FUSED`/`TAG_ONLY`/`COLOR_ONLY`/`UGV_POSE`/`PREDICT` 跟踪结果，融合视觉位置、车端速度、车端位姿 fallback 和短时预测。
   - `frame_alignment.py`：无人车坐标系到无人机局部坐标系的旋转/平移在线对齐。
   - `vehicle_state.py`：无人车 TCP 上行状态包解析、最新状态缓存、可选后台接收器。
-  - `control_modes.py`：键盘控制模式切换和飞控指令分发。
+  - `control_modes.py`：键盘控制模式切换、控制模式快照和飞控指令分发；模式 4 支持任务门控，未完成首次对齐时保持悬停且不发送跟踪 `set_pose()`。
+  - `codex_flight_log.py`：为每次运行生成 `logs/flight_YYYYmmdd_HHMMSS_<gitsha>.jsonl`，记录配置、事件、低频 sample 和退出摘要，供飞行后由 Codex 分析。
   - `debug_tools.py`：图像转储、视频转换、UDP 图传初始化和退出收尾。
 
 - `kb_wifi_connect.py`
@@ -77,6 +81,10 @@
   - `record_clean_video.py` 用于录制无叠加标记的干净相机视频，默认输出到 `image_output/video/`；运行会打开摄像头。
   - `color_marker_hsv_tuner_windows.py` 是可脱离本工程运行的 Windows 单文件离线调参脚本，主要配合录制视频使用。
 
+- `nested_apriltag_output/`
+  - 当前嵌套 AprilTag + 彩色备用标志的生成结果，包括 A3 PDF/PNG 和 `color_marker_layout.json`。
+  - 通常作为打印/标定资料使用；除非重新生成标志板，否则不要手工改这里的输出文件。
+
 - `reference/graduation_ugv_firmware/`
   - 从 GitHub clone 的无人车端 TC387 单片机工程，仓库地址为 `https://github.com/KrisBertram/graduation_ugv_firmware.git`。
   - 作为无人机端开发的只读参考代码使用；除非用户明确要求跨仓库修改并 push，否则不要直接改这里。
@@ -87,12 +95,17 @@
 - `image_output/`
   - 调试图像和视频输出目录，通常不要阅读、改动或清理。
 
+- `logs/`
+  - Codex 飞行复盘日志输出目录，已加入 `.gitignore`。
+  - 每次运行 `main.py` 且 `CODEX_FLIGHT_LOG_ENABLED=True` 时会生成一个 JSONL 文件；飞行后分析问题时可优先查看这里的最新日志。
+
 - `temp/`
   - 已过期或废弃文件，通常没有参考价值，默认不要阅读或改动。
 
 ## 硬件与安全边界
 
 - 不要在未明确获得用户要求和安全确认时运行会影响真实硬件的脚本，尤其是包含解锁、起飞、降落、移动、串口飞控通信、WiFi 切换、摄像头独占访问的程序。
+- `main.py` 顶部的 `DATALINK_ENABLED`、`VEHICLE_TCP_ENABLED`、`UDP_SENDER_ENABLED` 等开关经常会随实测阶段调整；运行前必须查看当前文件内容和 `git diff`，不要凭记忆假设它们是关闭状态。
 - 运行以下文件通常需要真实 Jetson/相机/飞控/网络环境：
   - `main.py`
   - `kb_wifi_connect.py`
@@ -145,7 +158,7 @@
 
 - 无人车到无人机局部系的在线对齐：
   - `FrameAligner` 估计二维变换：`p_drone = R(theta) * p_vehicle + t`。
-  - 首次同时拿到有效车端状态、无人机状态和 AprilTag 视觉观测时，直接计算 `theta` 和 `t`；后续看到 Tag 时低通在线修正。
+  - 首次同时拿到有效车端状态、无人机局部状态和有效视觉观测时，直接计算 `theta` 和 `t`；后续看到视觉标记时低通在线修正。
   - 当前默认 Tag 中心就是车辆/平台参考点，未配置 Tag 相对车体中心的安装偏置。
   - 如果 `TAG_FORWARD_AXIS` 或实际安装方向错误，车端 `speed + yaw` 前馈方向会错，参考轨迹效果会明显变差。
 
@@ -167,25 +180,34 @@
   - `body_dx = -pnp_y`
   - `body_dy = pnp_x`
   - `body_dz = -pnp_z`
-- 参考轨迹跟踪默认由 `main.py` 中的 `VEHICLE_TCP_ENABLED=False` 关闭车端 TCP 接入；关闭时只使用视觉估计生成平滑参考轨迹。
-- 车端 TCP 打开后，无人车 `speed + yaw` 会通过 `FrameAligner` 转到无人机局部坐标系，作为目标速度前馈；车端状态超过 `VEHICLE_STATE_TIMEOUT_S` 后自动退回视觉估速。
-- 坐标系在线对齐默认假设 Tag 中心就是车辆/平台参考点，Tag 的 `+Y` 轴与无人车车头方向一致；若实物安装不同，应优先调整 `TAG_FORWARD_AXIS` 或后续增加安装偏置配置。
-- 偏航控制使用 `solvePnP` 得到的 `rvec`，从 Tag 坐标轴候选法向中选择最接近机体正前方的方向，并带有滞后项 `_yaw_locked_edge_idx` 防抖。
+- 偏航控制当前使用 `solvePnP` 得到的 `rvec` 和 `TAG_FORWARD_AXIS`，调用 `compute_forward_yaw_cmd()` 让无人机机头跟随 Tag/车辆前向轴；旧的“选择最近垂直边”逻辑已经删除。
+- 参考轨迹跟踪由 `uav_core/tracking_fusion.py` 统一生成结果：
+  - 视觉成功时，AprilTag 或彩色 PnP 作为主测量，可结合车端速度前馈；若启用车端位置融合且视觉/车端残差足够小，source 为 `TAG_FUSED` 或 `COLOR_FUSED`，否则为 `TAG_ONLY` 或 `COLOR_ONLY`。
+  - 视觉失败时，若车端状态有效、无人机局部状态有效且 `FrameAligner.initialized=True`，可进入 `UGV_POSE` fallback；否则保留短时 `PREDICT`，再交给控制模式丢失保护。
+  - 车端位置融合和 UGV fallback 分别由 `VEHICLE_POSE_FUSION_ENABLED`、`VEHICLE_POSE_FALLBACK_ENABLED` 控制；现场调参时不要只看代码默认值，要看当前 `main.py` 实际开关。
+- 坐标系在线对齐默认假设 Tag/彩色板中心就是车辆/平台参考点，Tag 的 `+Y` 轴与无人车车头方向一致；若实物安装不同，应优先调整安装或 `TAG_FORWARD_AXIS`，后续再考虑增加安装偏置配置。
+- `main.py` 中 `TRACKING_REQUIRE_INITIAL_ALIGNMENT=True` 时，模式 4 在 `FrameAligner.initialized=True` 前只继续感知、融合和记录日志，不向飞控发送跟踪 `set_pose()`；图像叠加和 Codex 日志会显示 `WAIT_FRAME_ALIGNMENT`。
+- `uav_core/codex_flight_log.py` 的 JSONL 日志固定包含 `t_wall`、`t_rel`、`kind`、`frame`、`data`。重要 `kind` 包括 `session_config`、`event`、`sample`、`session_end`；写入失败只 warning，不应影响主控制链路。
 - `uav_core/control_modes.py` 中的控制模式由键盘输入切换：
   - `0` 手动待机
   - `1` 起飞
   - `2` 降落
   - `3` 悬停待机
-  - `4` AprilTag 跟踪
+  - `4` AprilTag/彩色视觉/车端融合跟踪
+  - 起飞流程中的 `data_link.set_takeoff(altitude=0)` 是与飞控端约定的固定写法，不要再抽成可调参数。
+  - 模式 4 内部支持 `tracking_task_ready` 门控；未就绪时只按节流日志提示等待，不进入丢失保护，也不发送零位移 `set_pose()`。
 
 ## 后续开发建议
 
 - 优先在 `main.py`、`uav_core/` 和 `kb_` 文件中寻找用户正在开发的逻辑。
+- 修改模式 4、车端融合、fallback 或降落状态机前，先确认 `TRACKING_REQUIRE_INITIAL_ALIGNMENT`、`FrameAligner.initialized`、`TrackingCommandResult.source` 和 Codex 飞行日志字段的语义。
 - 如果要把视觉追踪和 WiFi/TCP 通信合并，注意线程、阻塞调用、共享状态和数据包频率；`TCPServer.start()` 当前会阻塞等待连接。
 - 无人车端协议参考仓库已放在 `reference/graduation_ugv_firmware/`；对接车机 TCP 数据包时，以该仓库的 `docs/vehicle_drone_protocol.md` 和 `code/wifi_packet.c/.h` 为准。
 - 修改 MAVLink 发送逻辑前，先确认坐标系、单位、`type_mask`、飞控期望的 frame，以及当前飞控状态来源是否有效。
 - 修改图传逻辑时，保持 UDP 包头格式和接收端一致；`FRAG_DATA_SIZE` 变更会影响链路丢包和延迟。
+- 飞行后问题复盘优先结合现场视频、控制台日志和 `logs/flight_*.jsonl`；Codex 日志比控制台日志更适合分析 source 切换、残差、模式门控、车端状态超时和控制量变化。
 - 不要把 `image_output/` 中的图片/视频作为代码上下文，除非用户明确要求分析某次飞行记录。
+- 不要把 `logs/` 中的飞行日志提交到 Git；需要分析时由用户明确指定具体日志文件或时间段。
 - 不要基于 `temp/` 中内容推断当前实现，除非用户明确要求追溯历史方案。
 - 不要把历史版本变更写进 `AGENTS.md`；日常变更以 Git commit 记录，阶段性版本差异可更新 `CHANGELOG.md`。
 
