@@ -48,8 +48,8 @@ from uav_core.visual_control import (
 
 DEBUG_MODE_ENABLED = False  # 是否启用调试模式，启用后会保存图像并生成视频
 UDP_SENDER_ENABLED = True  # 是否启用 UDP 高速图传
-DATALINK_ENABLED = False  # 是否启用飞控通信链路，启用后会根据控制模式发送指令到飞控
-VEHICLE_TCP_ENABLED = False  # 是否启用无人车 TCP 状态接入，默认关闭，避免运行 main.py 时阻塞网络
+DATALINK_ENABLED = True  # 是否启用飞控通信链路，启用后会根据控制模式发送指令到飞控
+VEHICLE_TCP_ENABLED = True  # 是否启用无人车 TCP 状态接入，默认关闭，避免运行 main.py 时阻塞网络
 COLOR_MARKER_ENABLED = True  # AprilTag 失败时是否启用彩色标记 PnP 备用视觉
 
 # 是否启用 Codex 飞行复盘日志。该日志写入 JSONL 文件，供飞行后诊断视觉/融合/控制链路。
@@ -76,7 +76,7 @@ CODEX_FLIGHT_LOG_EVENT_MIN_INTERVAL_S = 0.8
 CODEX_FLIGHT_LOG_FLUSH_INTERVAL_S = 1.0
 
 UDP_RECEIVER_IP = "10.105.26.61"  # UDP 图传接收端 IP 地址，需与接收端设置一致
-UDP_SENDER_QUALITY = 20  # JPEG 压缩质量，范围 0-100，数值越小压缩越强，传输更快但图像质量更差
+UDP_SENDER_QUALITY = 30  # JPEG 压缩质量，范围 0-100，数值越小压缩越强，传输更快但图像质量更差
 
 # 飞控连接等待轮询间隔：等待 MAVLink 心跳时每次 sleep 的时间。
 # 调大：等待日志更少、CPU 占用更低；调小：连接成功后进入主流程更快。
@@ -182,11 +182,11 @@ VEHICLE_VEL_WEIGHT = 0.6
 
 # 视觉有效时是否允许融合车端位置。关闭后仍可使用车端速度前馈和更新 FrameAligner。
 # 调试建议：车端坐标、yaw、FrameAligner 首次对齐未确认前可先设 False；确认后设 True。
-VEHICLE_POSE_FUSION_ENABLED = True
+VEHICLE_POSE_FUSION_ENABLED = False
 
 # 视觉失效时是否允许车端位姿接管参考点。必须先完成 FrameAligner 对齐，否则不会启用。
 # 调试建议：首次实测可先保持 True 但让 DATALINK_ENABLED=False 观察日志；确认 source=UGV_POSE 稳定后再接飞控。
-VEHICLE_POSE_FALLBACK_ENABLED = True
+VEHICLE_POSE_FALLBACK_ENABLED = False
 
 # 车端位姿 fallback 最长持续时间：距离上次视觉成功超过该时间后，不再单独相信车端位姿。
 # 调大：长时间视觉丢失仍能跟随车端轨迹；过大时坐标系漂移后风险增加。
