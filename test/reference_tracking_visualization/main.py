@@ -8,7 +8,7 @@
 - 接收无人车 TCP 位姿；
 - 视觉有效时复用 AprilTag/彩色备用 PnP 和 FrameAligner；
 - 复用 TargetEstimator、ReferenceTrajectory 和 build_tracking_command()；
-- 在相机画面下方绘制参考轨迹地图画布；
+- 在相机画面中按物理比例绘制参考轨迹关键点；
 - 通过 UDP 图传输出带叠加信息的画面，同时可保存 MP4。
 
 安全边界：本脚本不连接飞控，不发送任何飞控控制指令。
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
@@ -65,7 +65,6 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "image_output" / "video"
 DEFAULT_UDP_IP = "10.105.26.61"
 
 TEXT_OVERLAY_ENABLED = False
-MAP_CANVAS_ENABLED = True
 CAMERA_TRACK_POINTS_ENABLED = True
 
 TAG_FORWARD_AXIS = "+Y"
@@ -87,17 +86,6 @@ TEXT_COLOR = (255, 255, 255)
 TEXT_BG = (35, 35, 35)
 TAG_AXIS_LABEL_COLOR = (0, 255, 0)
 COLOR_AXIS_LABEL_COLOR = (255, 255, 0)
-
-MAP_BG = (24, 27, 31)
-MAP_GRID = (62, 67, 72)
-MAP_AXIS = (245, 245, 245)
-MAP_MEASUREMENT = (0, 230, 80)
-MAP_ESTIMATOR = (240, 240, 240)
-MAP_FUTURE = (0, 165, 255)
-MAP_REFERENCE = (255, 230, 0)
-MAP_COMMAND = (255, 0, 255)
-MAP_LIMIT = (115, 115, 120)
-MAP_VELOCITY = (80, 210, 255)
 
 
 @dataclass
@@ -176,259 +164,6 @@ class CameraPlaneScaleCache:
     @property
     def available(self):
         return self.meter_per_pixel is not None and self.meter_per_pixel > 0.0
-
-
-@dataclass
-class TrackingMapRenderer:
-    """下方俯视地图画布：展示参考轨迹生成链路。"""
-
-    enabled: bool = MAP_CANVAS_ENABLED
-    max_history: int = 320
-    measurement_history: List[np.ndarray] = field(default_factory=list)
-    future_history: List[np.ndarray] = field(default_factory=list)
-    reference_history: List[np.ndarray] = field(default_factory=list)
-    command_history: List[np.ndarray] = field(default_factory=list)
-    estimator_history: List[np.ndarray] = field(default_factory=list)
-    source: str = "LOST"
-    measurement_xy: Optional[np.ndarray] = None
-    estimator_xy: Optional[np.ndarray] = None
-    future_xy: Optional[np.ndarray] = None
-    reference_xy: Optional[np.ndarray] = None
-    command_xy: Optional[np.ndarray] = None
-    fused_vel: Optional[np.ndarray] = None
-    used_vehicle_vel: bool = False
-    vehicle_pose_status: str = "off"
-    residual_m: Optional[float] = None
-
-    def update(self, tracking_result, target_estimator, source, config):
-        if not self.enabled:
-            return
-
-        self.source = source
-        self.measurement_xy = None
-        self.future_xy = None
-        self.reference_xy = None
-        self.command_xy = None
-        self.fused_vel = None
-        self.used_vehicle_vel = False
-        self.vehicle_pose_status = "off"
-        self.residual_m = None
-
-        if target_estimator.initialized:
-            self.estimator_xy = target_estimator.pos.copy()
-            self._append(self.estimator_history, self.estimator_xy)
-        else:
-            self.estimator_xy = None
-
-        if tracking_result is None:
-            return
-
-        if tracking_result.target_xy is not None:
-            self.measurement_xy = np.asarray(tracking_result.target_xy, dtype=float).copy()
-            self._append(self.measurement_history, self.measurement_xy)
-
-        self.future_xy = np.asarray(tracking_result.future_xy, dtype=float).copy()
-        self.reference_xy = np.asarray(tracking_result.ref_xy, dtype=float).copy()
-        self.command_xy = np.asarray(tracking_result.cmd_body, dtype=float).copy()
-        self.fused_vel = np.asarray(tracking_result.fused_vel, dtype=float).copy()
-        self.used_vehicle_vel = bool(tracking_result.used_vehicle_vel)
-        self.vehicle_pose_status = vehicle_pose_status(tracking_result, config)
-        self.residual_m = tracking_result.vehicle_visual_residual_m
-
-        self._append(self.future_history, self.future_xy)
-        self._append(self.reference_history, self.reference_xy)
-        self._append(self.command_history, self.command_xy)
-
-    def compose(self, camera_canvas, config):
-        if not self.enabled:
-            return camera_canvas
-        map_canvas = self.render_map_canvas(camera_canvas.shape, config)
-        return np.vstack([camera_canvas, map_canvas])
-
-    def render_map_canvas(self, frame_shape, config):
-        height, width = frame_shape[:2]
-        canvas = np.full((height, width, 3), MAP_BG, dtype=np.uint8)
-        x0, y0 = 0, 0
-        x1, y1 = width - 1, height - 1
-        cv2.rectangle(canvas, (x0, y0), (x1, y1), (95, 100, 105), 1, cv2.LINE_AA)
-
-        points = self._map_points(config)
-        scale, origin_px = self._map_transform(points, width, height)
-        self._draw_grid(canvas, origin_px)
-        cmd_limit_m = current_cmd_limit(config, self.source)
-        self._draw_limit_circle(canvas, origin_px, scale, cmd_limit_m)
-        self._draw_axes(canvas, origin_px, scale)
-
-        self._draw_polyline(canvas, self.measurement_history, origin_px, scale, MAP_MEASUREMENT, dotted=True, thickness=2)
-        self._draw_polyline(canvas, self.estimator_history, origin_px, scale, MAP_ESTIMATOR, dotted=True, thickness=1)
-        self._draw_polyline(canvas, self.future_history, origin_px, scale, MAP_FUTURE, dotted=False, thickness=2)
-        self._draw_polyline(canvas, self.reference_history, origin_px, scale, MAP_REFERENCE, dotted=False, thickness=3)
-        self._draw_polyline(canvas, self.command_history, origin_px, scale, MAP_COMMAND, dotted=False, thickness=2)
-
-        self._draw_current_points(canvas, origin_px, scale)
-        self._draw_legend(canvas, config)
-        return canvas
-
-    def _append(self, history, point):
-        history.append(np.asarray(point, dtype=float).copy())
-        if len(history) > self.max_history:
-            del history[0:len(history) - self.max_history]
-
-    def _map_points(self, config):
-        points = [np.array([0.0, 0.0], dtype=float)]
-        radius = max(float(config.max_cmd_offset_m), float(config.ugv_fallback_max_cmd_offset_m), 0.5)
-        points.extend(
-            [
-                np.array([radius, radius], dtype=float),
-                np.array([-radius, -radius], dtype=float),
-            ]
-        )
-        points.extend(self.measurement_history)
-        points.extend(self.estimator_history)
-        points.extend(self.future_history)
-        points.extend(self.reference_history)
-        points.extend(self.command_history)
-        for point in (
-            self.measurement_xy,
-            self.estimator_xy,
-            self.future_xy,
-            self.reference_xy,
-            self.command_xy,
-        ):
-            if point is not None:
-                points.append(point)
-        return points
-
-    def _map_transform(self, points, width, height):
-        arr = np.asarray(points, dtype=float)
-        min_xy = np.min(arr, axis=0)
-        max_xy = np.max(arr, axis=0)
-        min_xy = np.minimum(min_xy, np.array([-0.8, -0.8]))
-        max_xy = np.maximum(max_xy, np.array([0.8, 0.8]))
-
-        size = np.maximum(max_xy - min_xy, 0.5)
-        padding = 70
-        usable_w = max(1, width - 2 * padding)
-        usable_h = max(1, height - 2 * padding)
-        # 地图中 +X/forward 向上，+Y/right 向右。
-        scale = min(usable_h / size[0], usable_w / size[1])
-        center_world = (min_xy + max_xy) * 0.5
-        center_px = np.array([width * 0.5, height * 0.54], dtype=float)
-        origin_px = np.array(
-            [
-                center_px[0] - center_world[1] * scale,
-                center_px[1] + center_world[0] * scale,
-            ],
-            dtype=float,
-        )
-        return scale, origin_px
-
-    def _to_px(self, xy, origin_px, scale):
-        xy = np.asarray(xy, dtype=float)
-        return (
-            int(round(origin_px[0] + xy[1] * scale)),
-            int(round(origin_px[1] - xy[0] * scale)),
-        )
-
-    def _draw_grid(self, canvas, origin_px):
-        height, width = canvas.shape[:2]
-        for x in range(0, width, 60):
-            cv2.line(canvas, (x, 0), (x, height - 1), MAP_GRID, 1, cv2.LINE_AA)
-        for y in range(0, height, 60):
-            cv2.line(canvas, (0, y), (width - 1, y), MAP_GRID, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (int(origin_px[0]), int(origin_px[1])), 7, MAP_AXIS, -1, cv2.LINE_AA)
-
-    def _draw_limit_circle(self, canvas, origin_px, scale, radius_m):
-        radius_px = int(round(max(0.0, radius_m) * scale))
-        if radius_px > 2:
-            cv2.circle(canvas, tuple(np.round(origin_px).astype(int)), radius_px, MAP_LIMIT, 2, cv2.LINE_AA)
-            cv2.putText(
-                canvas,
-                "Max Cmd Radius",
-                (int(origin_px[0]) + radius_px + 8, int(origin_px[1]) + 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.52,
-                MAP_LIMIT,
-                1,
-                cv2.LINE_AA,
-            )
-
-    def _draw_axes(self, canvas, origin_px, scale):
-        axis_len_px = int(np.clip(0.48 * scale, 35, 95))
-        origin = tuple(np.round(origin_px).astype(int))
-        x_end = (origin[0], origin[1] - axis_len_px)
-        y_end = (origin[0] + axis_len_px, origin[1])
-        cv2.arrowedLine(canvas, origin, x_end, MAP_AXIS, 2, cv2.LINE_AA, tipLength=0.22)
-        cv2.arrowedLine(canvas, origin, y_end, MAP_AXIS, 2, cv2.LINE_AA, tipLength=0.22)
-        cv2.putText(canvas, "UAV", (origin[0] + 8, origin[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.65, MAP_AXIS, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "+X", (x_end[0] + 6, x_end[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, MAP_AXIS, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "+Y", (y_end[0] + 8, y_end[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, MAP_AXIS, 1, cv2.LINE_AA)
-
-    def _draw_polyline(self, canvas, history, origin_px, scale, color, dotted=False, thickness=2):
-        if len(history) < 2:
-            return
-        points = [self._to_px(point, origin_px, scale) for point in history]
-        for idx in range(1, len(points)):
-            if dotted and idx % 2 == 0:
-                continue
-            cv2.line(canvas, points[idx - 1], points[idx], color, thickness, cv2.LINE_AA)
-
-    def _draw_point_label(self, canvas, xy, origin_px, scale, color, label, radius=7, offset=(9, -9)):
-        px = self._to_px(xy, origin_px, scale)
-        cv2.circle(canvas, px, radius, color, -1, cv2.LINE_AA)
-        cv2.putText(
-            canvas,
-            label,
-            (px[0] + offset[0], px[1] + offset[1]),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
-        return px
-
-    def _draw_current_points(self, canvas, origin_px, scale):
-        if self.measurement_xy is not None:
-            self._draw_point_label(canvas, self.measurement_xy, origin_px, scale, MAP_MEASUREMENT, "Measurement")
-        if self.estimator_xy is not None:
-            self._draw_point_label(canvas, self.estimator_xy, origin_px, scale, MAP_ESTIMATOR, "Estimator", radius=6, offset=(9, 18))
-        if self.future_xy is not None:
-            self._draw_point_label(canvas, self.future_xy, origin_px, scale, MAP_FUTURE, "Future Point", radius=7)
-        if self.reference_xy is not None:
-            self._draw_point_label(canvas, self.reference_xy, origin_px, scale, MAP_REFERENCE, "Reference Point", radius=8, offset=(9, 20))
-        if self.command_xy is not None:
-            origin = self._to_px(np.zeros(2, dtype=float), origin_px, scale)
-            cmd_px = self._to_px(self.command_xy, origin_px, scale)
-            cv2.arrowedLine(canvas, origin, cmd_px, MAP_COMMAND, 4, cv2.LINE_AA, tipLength=0.18)
-            cv2.putText(canvas, "Command", (cmd_px[0] + 9, cmd_px[1] - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.62, MAP_COMMAND, 2, cv2.LINE_AA)
-        if self.estimator_xy is not None and self.fused_vel is not None:
-            vel_end = self.estimator_xy + 0.45 * self.fused_vel
-            cv2.arrowedLine(
-                canvas,
-                self._to_px(self.estimator_xy, origin_px, scale),
-                self._to_px(vel_end, origin_px, scale),
-                MAP_VELOCITY,
-                2,
-                cv2.LINE_AA,
-                tipLength=0.25,
-            )
-
-    def _draw_legend(self, canvas, config):
-        residual = "n/a" if self.residual_m is None else f"{self.residual_m:.2f}m"
-        vel_text = "on" if self.used_vehicle_vel else "off"
-        lines = [
-            f"Source: {self.source}",
-            f"lookahead={config.lookahead_time_s:.2f}s  "
-            f"ref_speed={getattr(config, 'max_ref_speed_mps', 0.0):.2f}m/s  "
-            f"cmd_limit={current_cmd_limit(config, self.source):.2f}m",
-            f"vehicle_vel={vel_text}  vehicle_pose={self.vehicle_pose_status}  residual={residual}",
-            "green=Measurement  white=Estimator  orange=Future  cyan=Reference  magenta=Command",
-        ]
-        y = 30
-        for line in lines:
-            cv2.putText(canvas, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.66, TEXT_COLOR, 2, cv2.LINE_AA)
-            y += 28
 
 
 def format_gst_framerate(fps):
@@ -1070,8 +805,6 @@ def parse_args():
     parser.add_argument("--no-save-video", action="store_true", help="不保存 MP4 视频。")
     parser.add_argument("--text-overlay", dest="text_overlay", action="store_true", default=TEXT_OVERLAY_ENABLED, help="显示相机画面右上角文字指标和坐标架文字标签。")
     parser.add_argument("--no-text-overlay", dest="text_overlay", action="store_false", help="隐藏相机画面文字叠加层。")
-    parser.add_argument("--map-canvas", dest="map_canvas", action="store_true", default=MAP_CANVAS_ENABLED, help="在相机画面下方显示参考轨迹地图画布。")
-    parser.add_argument("--no-map-canvas", dest="map_canvas", action="store_false", help="隐藏参考轨迹地图画布。")
     parser.add_argument("--camera-track-points", dest="camera_track_points", action="store_true", default=CAMERA_TRACK_POINTS_ENABLED, help="在相机画面中按物理比例绘制参考轨迹关键点。")
     parser.add_argument("--no-camera-track-points", dest="camera_track_points", action="store_false", help="隐藏相机画面中的参考轨迹关键点。")
     parser.add_argument("--color-marker", dest="color_marker", action="store_true", default=True, help="启用彩色备用 PnP。")
@@ -1119,7 +852,6 @@ def main():
 
     writer = None
     recording_started = False
-    map_renderer = TrackingMapRenderer(enabled=args.map_canvas)
     scale_cache = CameraPlaneScaleCache()
     run_stats = RunStats()
     last_visual_time = None
@@ -1131,7 +863,6 @@ def main():
     logger.info(f"UDP 图传: {'关闭' if sender is None else f'{args.udp_ip}:{args.udp_port}'}")
     logger.info(f"MP4 保存: {'关闭' if output_path is None else str(output_path) + '（首次视觉观测后开始写入）'}")
     logger.info(f"文字叠加层: {'开启' if args.text_overlay else '关闭'}")
-    logger.info(f"参考轨迹地图画布: {'开启' if args.map_canvas else '关闭'}")
     logger.info(f"相机画面参考点: {'开启' if args.camera_track_points else '关闭'}")
     logger.info(
         f"跟踪参数: lookahead={config.lookahead_time_s:.2f}s "
@@ -1188,8 +919,7 @@ def main():
                 recording_started = True
                 logger.info(f"首次视觉观测成功，开始录制 MP4: {output_path}")
 
-            map_renderer.update(tracking_result, target_estimator, source, config)
-            camera_canvas = render_camera_canvas(
+            canvas = render_camera_canvas(
                 frame,
                 visual_pose,
                 tracking_result,
@@ -1204,7 +934,6 @@ def main():
                 text_overlay_enabled=args.text_overlay,
                 camera_track_points_enabled=args.camera_track_points,
             )
-            canvas = map_renderer.compose(camera_canvas, config)
 
             if recording_started and writer is None and output_path is not None:
                 height, width = canvas.shape[:2]
