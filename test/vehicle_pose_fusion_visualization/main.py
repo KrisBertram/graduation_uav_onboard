@@ -15,7 +15,9 @@
 
 import argparse
 import math
+import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -57,6 +59,9 @@ from utils.udp_video_sender import DEFAULT_PORT, VideoSender  # noqa: E402
 WINDOW_NAME = "Vehicle Pose Fusion Visualization"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "image_output" / "video"
 DEFAULT_UDP_IP = "10.105.26.61"
+
+# 文字叠加层总开关。False 时只保留相机画面、灰色未知区域和三维坐标架。
+TEXT_OVERLAY_ENABLED = True
 
 TAG_FORWARD_AXIS = "+Y"
 VEHICLE_STATE_TIMEOUT_S = 0.3
@@ -508,7 +513,7 @@ def draw_text_with_background(img, text, org, scale=0.55, color=TEXT_COLOR, bg=T
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 
-def draw_pose_axes(canvas, pose: PoseObservation, view_state: ViewState, label_color):
+def draw_pose_axes(canvas, pose: PoseObservation, view_state: ViewState, label_color, text_overlay_enabled=True):
     points = project_axis_points(pose)
     if not np.all(np.isfinite(points)):
         return
@@ -519,6 +524,8 @@ def draw_pose_axes(canvas, pose: PoseObservation, view_state: ViewState, label_c
     cv2.line(canvas, origin, tuple(points[2]), (0, 255, 0), 3, cv2.LINE_AA)
     cv2.line(canvas, origin, tuple(points[3]), (255, 0, 0), 3, cv2.LINE_AA)
     cv2.circle(canvas, origin, 4, label_color, -1, cv2.LINE_AA)
+    if not text_overlay_enabled:
+        return
     draw_text_with_background(
         canvas,
         pose.source,
@@ -610,12 +617,24 @@ def draw_overlay(canvas, source, vehicle_state, frame_aligner, errors: ErrorStat
         y += line_gap
 
 
-def render_canvas(frame, visual_pose, estimated_pose, source, view_state, vehicle_state, frame_aligner, errors, run_stats, output_path):
+def render_canvas(
+    frame,
+    visual_pose,
+    estimated_pose,
+    source,
+    view_state,
+    vehicle_state,
+    frame_aligner,
+    errors,
+    run_stats,
+    output_path,
+    text_overlay_enabled=True,
+):
     frame_for_canvas = frame.copy()
 
     if visual_pose is not None and visual_pose.source == "VISION_TAG":
         draw_tag_annotations(frame_for_canvas, visual_pose)
-    elif visual_pose is not None and visual_pose.color_observation is not None:
+    elif text_overlay_enabled and visual_pose is not None and visual_pose.color_observation is not None:
         draw_color_marker_debug(frame_for_canvas, visual_pose.color_observation)
 
     pose_for_view = estimated_pose if visual_pose is None else None
@@ -627,12 +646,42 @@ def render_canvas(frame, visual_pose, estimated_pose, source, view_state, vehicl
     draw_fov_border(canvas, frame.shape, view_state)
 
     if visual_pose is not None:
-        draw_pose_axes(canvas, visual_pose, view_state, VISION_AXIS_LABEL_COLOR)
+        draw_pose_axes(canvas, visual_pose, view_state, VISION_AXIS_LABEL_COLOR, text_overlay_enabled)
     elif estimated_pose is not None:
-        draw_pose_axes(canvas, estimated_pose, view_state, EST_AXIS_LABEL_COLOR)
+        draw_pose_axes(canvas, estimated_pose, view_state, EST_AXIS_LABEL_COLOR, text_overlay_enabled)
 
-    draw_overlay(canvas, source, vehicle_state, frame_aligner, errors, run_stats, output_path)
+    if text_overlay_enabled:
+        draw_overlay(canvas, source, vehicle_state, frame_aligner, errors, run_stats, output_path)
     return canvas
+
+
+def install_stop_handlers(stop_event):
+    """注册 Ctrl+C、kill 和 SSH stdin 退出入口，保证能进入 finally 保存视频。"""
+    def request_stop(signum=None, _frame=None):
+        if signum is None:
+            logger.info("收到停止输入，准备退出")
+        else:
+            logger.info(f"收到退出信号 {signum}，准备退出")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
+    def stdin_watcher():
+        while not stop_event.is_set():
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                return
+            if line == "":
+                return
+            if line.strip().lower() in ("q", "quit", "exit", "stop"):
+                request_stop()
+                return
+
+    if sys.stdin is not None and sys.stdin.isatty():
+        thread = threading.Thread(target=stdin_watcher, name="VisualizationStopInput", daemon=True)
+        thread.start()
 
 
 def print_summary(run_stats: RunStats, errors: ErrorStats, output_path, elapsed_s):
@@ -675,6 +724,8 @@ def parse_args():
     parser.add_argument("--preview", action="store_true", help="在本机显示 OpenCV 预览窗口。")
     parser.add_argument("--no-save-video", action="store_true", help="不保存 MP4 视频。")
     parser.add_argument("--fallback-max-s", type=float, default=5.0, help="视觉丢失后车端位姿估计最长持续时间。")
+    parser.add_argument("--text-overlay", dest="text_overlay", action="store_true", default=TEXT_OVERLAY_ENABLED, help="显示右上角文字指标和坐标架文字标签。")
+    parser.add_argument("--no-text-overlay", dest="text_overlay", action="store_false", help="隐藏文字叠加层，只保留画面、灰区和坐标架。")
     parser.add_argument("--color-marker", dest="color_marker", action="store_true", default=True, help="启用彩色备用 PnP。")
     parser.add_argument("--no-color-marker", dest="color_marker", action="store_false", help="关闭彩色备用 PnP。")
 
@@ -690,6 +741,8 @@ def parse_args():
 def main():
     args = parse_args()
     output_path = None if args.no_save_video else build_output_path(args)
+    stop_event = threading.Event()
+    install_stop_handlers(stop_event)
 
     cap, capture_description = open_capture(args)
     detector = init_detector()
@@ -719,16 +772,18 @@ def main():
     logger.info(capture_description)
     logger.info(f"UDP 图传: {'关闭' if sender is None else f'{args.udp_ip}:{args.udp_port}'}")
     logger.info(f"MP4 保存: {'关闭' if output_path is None else output_path}")
-    logger.info("按 Ctrl+C 结束；如果启用 --preview，也可在窗口中按 q 或 Esc 结束。")
+    logger.info(f"文字叠加层: {'开启' if args.text_overlay else '关闭'}")
+    logger.info("结束方式：按 Ctrl+C，或在 SSH 终端输入 q 后回车；如果启用 --preview，也可在窗口中按 q 或 Esc。")
 
     if args.preview:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
     try:
-        while True:
+        while not stop_event.is_set():
             ok, frame = cap.read()
             if not ok or frame is None:
                 logger.warning("读取相机画面失败，跳过本帧")
+                time.sleep(0.02)
                 continue
 
             now_wall = time.time()
@@ -772,6 +827,7 @@ def main():
                 errors,
                 run_stats,
                 output_path,
+                text_overlay_enabled=args.text_overlay,
             )
 
             if writer is None and output_path is not None:
@@ -788,11 +844,11 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     logger.info("用户通过预览窗口结束演示")
-                    break
+                    stop_event.set()
 
             if args.duration > 0.0 and time.monotonic() - start_monotonic >= args.duration:
                 logger.info("达到指定运行时长，结束演示")
-                break
+                stop_event.set()
 
     except KeyboardInterrupt:
         logger.info("收到 Ctrl+C，准备退出")
