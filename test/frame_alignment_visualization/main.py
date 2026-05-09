@@ -7,7 +7,7 @@ FrameAligner 车端坐标系到无人机坐标系在线对齐可视化演示脚�
 - 读取下视相机画面；
 - 接收无人车 TCP 位姿；
 - 视觉有效时绘制真实 PnP 坐标架并在线对齐车端坐标系；
-- 在右下角俯视小地图中展示车端原始坐标系如何旋转和平移到无人机坐标系；
+- 在相机画面下方的俯视地图画布中展示车端原始坐标系如何旋转和平移到无人机坐标系；
 - 视觉丢失时用车端位姿估计降落点，并在灰色未知区域继续绘制坐标架；
 - 通过 UDP 图传输出带叠加信息的画面，同时可保存 MP4。
 
@@ -168,7 +168,7 @@ class RunStats:
 
 
 def rotate_xy_2d(vec_xy, yaw):
-    """二维向量旋转，用于小地图播放 FrameAligner 的 R(theta)+t 动画。"""
+    """二维向量旋转，用于地图画布播放 FrameAligner 的 R(theta)+t 动画。"""
     vec_xy = np.asarray(vec_xy, dtype=float)
     c = math.cos(yaw)
     s = math.sin(yaw)
@@ -179,7 +179,7 @@ def rotate_xy_2d(vec_xy, yaw):
 
 @dataclass
 class AlignmentMapRenderer:
-    """右下角俯视小地图：展示车端坐标系逐步对齐到无人机坐标系。"""
+    """俯视地图画布：展示车端坐标系逐步对齐到无人机坐标系。"""
 
     enabled: bool = ALIGNMENT_MAP_ENABLED
     max_history: int = 260
@@ -226,24 +226,23 @@ class AlignmentMapRenderer:
         self.was_initialized = frame_aligner.initialized
         self.status = self._status(now, visual_pose, frame_aligner)
 
-    def draw(self, canvas, now, frame_aligner):
+    def compose(self, camera_canvas, now, frame_aligner):
         if not self.enabled:
-            return
+            return camera_canvas
 
-        height, width = canvas.shape[:2]
-        map_w = max(340, int(width * 0.42))
-        map_h = max(220, int(height * 0.40))
-        map_w = min(map_w, width - 24)
-        map_h = min(map_h, height - 24)
-        x0 = width - map_w - 14
-        y0 = height - map_h - 14
-        x1 = x0 + map_w
-        y1 = y0 + map_h
+        map_canvas = self.render_map_canvas(camera_canvas.shape, now, frame_aligner)
+        return np.vstack([camera_canvas, map_canvas])
 
-        roi = canvas[y0:y1, x0:x1]
-        overlay = roi.copy()
-        overlay[:] = ALIGN_MAP_BG
-        cv2.addWeighted(overlay, 0.86, roi, 0.14, 0.0, dst=roi)
+    def render_map_canvas(self, frame_shape, now, frame_aligner):
+        height, width = frame_shape[:2]
+        canvas = np.full((height, width, 3), ALIGN_MAP_BG, dtype=np.uint8)
+        map_w = width
+        map_h = height
+        x0 = 0
+        y0 = 0
+        x1 = width - 1
+        y1 = height - 1
+
         cv2.rectangle(canvas, (x0, y0), (x1, y1), (95, 100, 105), 1, cv2.LINE_AA)
 
         points = self._map_points(frame_aligner)
@@ -255,20 +254,20 @@ class AlignmentMapRenderer:
             origin_px,
             scale,
             0.0,
-            "UGV raw frame",
+            "UGV Raw Origin",
             ALIGN_MAP_RAW,
-            label_offset=(6, 16),
+            label_offset=(8, 24),
             axis_scale=0.30,
-            thickness=1,
+            thickness=2,
         )
         self._draw_world_axes(
             canvas,
             origin_px,
             scale,
             0.0,
-            "UAV frame",
+            "UAV Frame",
             ALIGN_MAP_DRONE,
-            label_offset=(6, -10),
+            label_offset=(8, -14),
         )
         self._draw_polyline(canvas, self.raw_history, origin_px, scale, ALIGN_MAP_RAW, dotted=True)
         self._draw_polyline(canvas, self.visual_history, origin_px, scale, ALIGN_MAP_VISUAL, dotted=False)
@@ -292,9 +291,9 @@ class AlignmentMapRenderer:
                 transformed_origin_px,
                 scale,
                 theta,
-                "UGV frame aligned",
+                "UGV Origin Aligned",
                 ALIGN_MAP_ALIGNED,
-                label_offset=(6, 18),
+                label_offset=(8, 28),
                 axis_scale=0.38,
             )
 
@@ -309,35 +308,35 @@ class AlignmentMapRenderer:
                 self._to_px(raw_axis_xy, origin_px, scale),
                 scale,
                 raw_axis_yaw,
-                "car raw",
+                "Current Car Raw",
                 ALIGN_MAP_RAW,
-                label_offset=(5, -6),
+                label_offset=(8, -12),
                 axis_scale=0.28,
-                thickness=1,
+                thickness=2,
             )
 
             aligned_axis_xy = rotate_xy_2d(raw_axis_xy, theta) + translation
             aligned_axis_yaw = wrap_angle(raw_axis_yaw + theta)
-            label = "car aligning" if self.status == "ALIGNING" else "car aligned"
             self._draw_world_axes(
                 canvas,
                 self._to_px(aligned_axis_xy, origin_px, scale),
                 scale,
                 aligned_axis_yaw,
-                label,
+                "Current Car",
                 ALIGN_MAP_ALIGNED,
                 axis_scale=0.32,
             )
 
         if self.last_visual_xy is not None:
-            cv2.circle(canvas, self._to_px(self.last_visual_xy, origin_px, scale), 5, ALIGN_MAP_VISUAL, -1, cv2.LINE_AA)
+            cv2.circle(canvas, self._to_px(self.last_visual_xy, origin_px, scale), 8, ALIGN_MAP_VISUAL, -1, cv2.LINE_AA)
 
         if self.last_aligned_xy is not None and self.last_visual_xy is not None:
             p0 = self._to_px(self.last_aligned_xy, origin_px, scale)
             p1 = self._to_px(self.last_visual_xy, origin_px, scale)
-            cv2.arrowedLine(canvas, p0, p1, ALIGN_MAP_RESIDUAL, 2, cv2.LINE_AA, tipLength=0.18)
+            cv2.arrowedLine(canvas, p0, p1, ALIGN_MAP_RESIDUAL, 3, cv2.LINE_AA, tipLength=0.18)
 
         self._draw_legend(canvas, x0, y0, frame_aligner, alpha)
+        return canvas
 
     def _append(self, history, point):
         history.append(np.asarray(point, dtype=float).copy())
@@ -398,8 +397,10 @@ class AlignmentMapRenderer:
             max_xy = np.maximum(max_xy, np.array([0.5, 0.5]))
 
         size = np.maximum(max_xy - min_xy, 0.5)
-        padding = 34
-        scale = min((map_w - 2 * padding) / size[0], (map_h - 2 * padding) / size[1])
+        padding = 70
+        usable_w = max(1, map_w - 2 * padding)
+        usable_h = max(1, map_h - 2 * padding)
+        scale = min(usable_w / size[0], usable_h / size[1])
         center_world = (min_xy + max_xy) * 0.5
         center_px = np.array([x0 + map_w * 0.5, y0 + map_h * 0.54], dtype=float)
         origin_px = center_px - np.array([center_world[0] * scale, -center_world[1] * scale], dtype=float)
@@ -413,11 +414,11 @@ class AlignmentMapRenderer:
         )
 
     def _draw_grid(self, canvas, x0, y0, x1, y1, origin_px):
-        for x in range(x0 + 40, x1, 40):
+        for x in range(x0 + 60, x1, 60):
             cv2.line(canvas, (x, y0), (x, y1), ALIGN_MAP_GRID, 1, cv2.LINE_AA)
-        for y in range(y0 + 40, y1, 40):
+        for y in range(y0 + 60, y1, 60):
             cv2.line(canvas, (x0, y), (x1, y), ALIGN_MAP_GRID, 1, cv2.LINE_AA)
-        cv2.circle(canvas, (int(origin_px[0]), int(origin_px[1])), 4, ALIGN_MAP_DRONE, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (int(origin_px[0]), int(origin_px[1])), 7, ALIGN_MAP_DRONE, -1, cv2.LINE_AA)
 
     def _draw_polyline(self, canvas, history, origin_px, scale, color, dotted=False):
         if len(history) < 2:
@@ -426,7 +427,7 @@ class AlignmentMapRenderer:
         for idx in range(1, len(points)):
             if dotted and idx % 2 == 0:
                 continue
-            cv2.line(canvas, points[idx - 1], points[idx], color, 2, cv2.LINE_AA)
+            cv2.line(canvas, points[idx - 1], points[idx], color, 3, cv2.LINE_AA)
 
     def _draw_world_axes(
         self,
@@ -440,7 +441,7 @@ class AlignmentMapRenderer:
         axis_scale=0.45,
         thickness=2,
     ):
-        axis_len_px = int(np.clip(axis_scale * scale, 16, 52))
+        axis_len_px = int(np.clip(axis_scale * scale, 24, 88))
         x_dir = np.array([math.cos(yaw), math.sin(yaw)])
         y_dir = np.array([math.cos(yaw + math.pi / 2), math.sin(yaw + math.pi / 2)])
         origin_arr = np.array(origin_px, dtype=float)
@@ -453,9 +454,9 @@ class AlignmentMapRenderer:
             label,
             (int(origin_arr[0]) + label_offset[0], int(origin_arr[1]) + label_offset[1]),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.42,
+            0.58,
             color,
-            1,
+            2,
             cv2.LINE_AA,
         )
 
@@ -465,12 +466,12 @@ class AlignmentMapRenderer:
             f"alpha={alpha:.2f}",
             f"theta={math.degrees(frame_aligner.theta):+.1f}deg" if frame_aligner.initialized else "theta=n/a",
             f"t=({frame_aligner.translation[0]:+.2f},{frame_aligner.translation[1]:+.2f})m" if frame_aligner.initialized else "t=n/a",
-            "gray=UGV raw/frame  cyan=aligned  green=vision",
+            "gray=UGV raw origin/path  cyan=aligned  green=vision",
         ]
-        y = y0 + 18
+        y = y0 + 30
         for line in lines:
-            cv2.putText(canvas, line, (x0 + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_COLOR, 1, cv2.LINE_AA)
-            y += 17
+            cv2.putText(canvas, line, (x0 + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.68, TEXT_COLOR, 2, cv2.LINE_AA)
+            y += 28
 
 
 def format_gst_framerate(fps):
@@ -1140,8 +1141,8 @@ def parse_args():
     parser.add_argument("--fallback-max-s", type=float, default=5.0, help="兼容保留参数；当前不再用于停止车端位姿估计。")
     parser.add_argument("--text-overlay", dest="text_overlay", action="store_true", default=TEXT_OVERLAY_ENABLED, help="显示右上角文字指标和坐标架文字标签。")
     parser.add_argument("--no-text-overlay", dest="text_overlay", action="store_false", help="隐藏文字叠加层，只保留画面、灰区和坐标架。")
-    parser.add_argument("--aligner-map", dest="aligner_map", action="store_true", default=ALIGNMENT_MAP_ENABLED, help="显示右下角 FrameAligner 对齐过程小地图。")
-    parser.add_argument("--no-aligner-map", dest="aligner_map", action="store_false", help="隐藏右下角 FrameAligner 对齐过程小地图。")
+    parser.add_argument("--aligner-map", dest="aligner_map", action="store_true", default=ALIGNMENT_MAP_ENABLED, help="在相机画面下方显示 FrameAligner 对齐过程地图画布。")
+    parser.add_argument("--no-aligner-map", dest="aligner_map", action="store_false", help="隐藏 FrameAligner 对齐过程地图画布。")
     parser.add_argument("--color-marker", dest="color_marker", action="store_true", default=True, help="启用彩色备用 PnP。")
     parser.add_argument("--no-color-marker", dest="color_marker", action="store_false", help="关闭彩色备用 PnP。")
 
@@ -1190,7 +1191,7 @@ def main():
     logger.info(f"UDP 图传: {'关闭' if sender is None else f'{args.udp_ip}:{args.udp_port}'}")
     logger.info(f"MP4 保存: {'关闭' if output_path is None else str(output_path) + '（首次视觉观测后开始写入）'}")
     logger.info(f"文字叠加层: {'开启' if args.text_overlay else '关闭'}")
-    logger.info(f"FrameAligner 小地图: {'开启' if args.aligner_map else '关闭'}")
+    logger.info(f"FrameAligner 地图画布: {'开启' if args.aligner_map else '关闭'}")
     logger.info("结束方式：按 Ctrl+C，或在 SSH 终端输入 q 后回车；如果启用 --preview，也可在窗口中按 q 或 Esc。")
 
     if args.preview:
@@ -1250,7 +1251,7 @@ def main():
                 recording_started=recording_started,
                 text_overlay_enabled=args.text_overlay,
             )
-            alignment_map.draw(canvas, now_wall, frame_aligner)
+            canvas = alignment_map.compose(canvas, now_wall, frame_aligner)
 
             if recording_started and writer is None and output_path is not None:
                 height, width = canvas.shape[:2]
