@@ -56,6 +56,7 @@ from uav_core.visual_control import (  # noqa: E402
     estimate_tag_forward_yaw_body,
     pnp_to_body_xy,
 )
+from utils.kb_TagVisualizer import TagVisualizer  # noqa: E402
 from utils.udp_video_sender import DEFAULT_PORT, VideoSender  # noqa: E402
 
 
@@ -65,6 +66,7 @@ DEFAULT_UDP_IP = "10.105.26.61"
 
 TEXT_OVERLAY_ENABLED = False
 MAP_CANVAS_ENABLED = True
+CAMERA_TRACK_POINTS_ENABLED = True
 
 TAG_FORWARD_AXIS = "+Y"
 VEHICLE_STATE_TIMEOUT_S = 0.3
@@ -78,6 +80,9 @@ DEFAULT_PREDICT_TIME_S = 1.0
 DEFAULT_UGV_FALLBACK_MAX_S = 5.0
 
 CAMERA_CMD_COLOR = (255, 0, 255)
+CAMERA_MEASUREMENT_COLOR = (0, 230, 80)
+CAMERA_FUTURE_COLOR = (0, 165, 255)
+CAMERA_REFERENCE_COLOR = (255, 230, 0)
 TEXT_COLOR = (255, 255, 255)
 TEXT_BG = (35, 35, 35)
 TAG_AXIS_LABEL_COLOR = (0, 255, 0)
@@ -137,6 +142,40 @@ class RunStats:
         if self.tracking_active_frames <= 0:
             return None
         return self.cmd_norm_sum / self.tracking_active_frames
+
+
+@dataclass
+class CameraPlaneScaleCache:
+    """缓存相机画面中平台平面的米/像素比例。"""
+
+    meter_per_pixel: Optional[float] = None
+    source: str = "none"
+    timestamp: Optional[float] = None
+
+    def update(self, visual_pose: Optional[PoseObservation], now):
+        if visual_pose is None:
+            return
+
+        meter_per_pixel = None
+        source = None
+        if visual_pose.source == "TAG" and visual_pose.image_points is not None and visual_pose.tag_id in TAG_SIZES:
+            meter_per_pixel = compute_tag_meter_per_pixel(visual_pose)
+            source = "tag"
+
+        if meter_per_pixel is None:
+            meter_per_pixel = compute_pinhole_meter_per_pixel(visual_pose)
+            source = "pinhole"
+
+        if meter_per_pixel is None:
+            return
+
+        self.meter_per_pixel = meter_per_pixel
+        self.source = source
+        self.timestamp = now
+
+    @property
+    def available(self):
+        return self.meter_per_pixel is not None and self.meter_per_pixel > 0.0
 
 
 @dataclass
@@ -581,39 +620,148 @@ def draw_pose_axes(canvas, pose: PoseObservation, label_color, text_overlay_enab
         )
 
 
-def body_xy_to_image_px(body_xy, frame_shape, pixels_per_m=120.0):
+def compute_tag_meter_per_pixel(visual_pose: PoseObservation):
+    """优先使用 AprilTag 在画面中的真实边长比例。"""
+    if visual_pose.image_points is None or visual_pose.tag_id not in TAG_SIZES:
+        return None
+    try:
+        meter_per_pixel = TagVisualizer.compute_pixel_scale_on_tag(
+            np.asarray(visual_pose.image_points, dtype=float),
+            TAG_SIZES[visual_pose.tag_id],
+        )
+    except Exception as err:
+        logger.warning(f"计算 AprilTag 平面比例失败: {err}")
+        return None
+    if not np.isfinite(meter_per_pixel) or meter_per_pixel <= 0.0:
+        return None
+    return float(meter_per_pixel)
+
+
+def compute_pinhole_meter_per_pixel(visual_pose: PoseObservation):
+    """彩色备用或无边框时，用当前高度和相机焦距估算米/像素。"""
+    if visual_pose.z_m <= 0.0:
+        return None
+    fx = float(cameraMatrix[0, 0])
+    fy = float(cameraMatrix[1, 1])
+    if fx <= 0.0 or fy <= 0.0:
+        return None
+    meter_per_pixel = 0.5 * (visual_pose.z_m / fx + visual_pose.z_m / fy)
+    if not np.isfinite(meter_per_pixel) or meter_per_pixel <= 0.0:
+        return None
+    return float(meter_per_pixel)
+
+
+def project_body_xy_to_image(body_xy, frame_shape, meter_per_pixel):
     height, width = frame_shape[:2]
     body_xy = np.asarray(body_xy, dtype=float)
     center = np.array([width * 0.5, height * 0.5], dtype=float)
-    return (
-        int(round(center[0] + body_xy[1] * pixels_per_m)),
-        int(round(center[1] - body_xy[0] * pixels_per_m)),
+    raw_px = np.array(
+        [
+            center[0] + body_xy[1] / meter_per_pixel,
+            center[1] - body_xy[0] / meter_per_pixel,
+        ],
+        dtype=float,
     )
+    clipped_px = np.array(
+        [
+            np.clip(raw_px[0], 0, width - 1),
+            np.clip(raw_px[1], 0, height - 1),
+        ],
+        dtype=float,
+    )
+    offscreen = bool(np.linalg.norm(raw_px - clipped_px) > 1e-6)
+    return tuple(np.round(raw_px).astype(int)), tuple(np.round(clipped_px).astype(int)), offscreen
 
 
-def draw_command_arrow(frame, tracking_result, config, text_overlay_enabled):
-    if tracking_result is None:
+def draw_camera_track_point(frame, label, body_xy, scale_cache, color, text_overlay_enabled, radius=6):
+    if not scale_cache.available:
+        return None
+    raw_px, clipped_px, offscreen = project_body_xy_to_image(
+        body_xy,
+        frame.shape,
+        scale_cache.meter_per_pixel,
+    )
+    cv2.circle(frame, clipped_px, radius, color, -1, cv2.LINE_AA)
+    cv2.circle(frame, clipped_px, radius + 3, color, 1, cv2.LINE_AA)
+    if text_overlay_enabled:
+        suffix = " offscreen" if offscreen else ""
+        draw_text_with_background(
+            frame,
+            f"{label}{suffix}",
+            (clipped_px[0] + 8, clipped_px[1] - 8),
+            scale=0.45,
+            color=color,
+            bg=(45, 45, 45),
+            thickness=1,
+        )
+    return raw_px, clipped_px, offscreen
+
+
+def draw_camera_tracking_points(frame, tracking_result, config, scale_cache, text_overlay_enabled, enabled=True):
+    if not enabled or tracking_result is None or not scale_cache.available:
         return
 
     center = (frame.shape[1] // 2, frame.shape[0] // 2)
     cmd_body = np.asarray(tracking_result.cmd_body, dtype=float)
-    endpoint = body_xy_to_image_px(cmd_body, frame.shape)
-    cv2.arrowedLine(frame, center, endpoint, CAMERA_CMD_COLOR, 4, cv2.LINE_AA, tipLength=0.22)
+    _, cmd_px, cmd_offscreen = project_body_xy_to_image(cmd_body, frame.shape, scale_cache.meter_per_pixel)
+    cv2.arrowedLine(frame, center, cmd_px, CAMERA_CMD_COLOR, 4, cv2.LINE_AA, tipLength=0.22)
     cv2.circle(frame, center, 5, CAMERA_CMD_COLOR, -1, cv2.LINE_AA)
 
-    max_radius_px = int(round(current_cmd_limit(config, tracking_result.source) * 120.0))
+    max_radius_px = int(round(current_cmd_limit(config, tracking_result.source) / scale_cache.meter_per_pixel))
     if max_radius_px > 3:
         cv2.circle(frame, center, max_radius_px, (170, 90, 170), 1, cv2.LINE_AA)
 
+    if tracking_result.target_xy is not None:
+        draw_camera_track_point(
+            frame,
+            "Measurement",
+            tracking_result.target_xy,
+            scale_cache,
+            CAMERA_MEASUREMENT_COLOR,
+            text_overlay_enabled,
+            radius=5,
+        )
+    draw_camera_track_point(
+        frame,
+        "Future Point",
+        tracking_result.future_xy,
+        scale_cache,
+        CAMERA_FUTURE_COLOR,
+        text_overlay_enabled,
+        radius=6,
+    )
+    reference_draw = draw_camera_track_point(
+        frame,
+        "Reference Point",
+        tracking_result.ref_xy,
+        scale_cache,
+        CAMERA_REFERENCE_COLOR,
+        text_overlay_enabled,
+        radius=8,
+    )
+    if reference_draw is not None:
+        _, ref_px, _ = reference_draw
+        cv2.arrowedLine(frame, center, ref_px, CAMERA_REFERENCE_COLOR, 3, cv2.LINE_AA, tipLength=0.18)
+
     if text_overlay_enabled:
         cmd_norm = float(np.linalg.norm(cmd_body))
+        cmd_suffix = " offscreen" if cmd_offscreen else ""
         draw_text_with_background(
             frame,
-            f"cmd dx={cmd_body[0]:+.2f} dy={cmd_body[1]:+.2f} | {cmd_norm:.2f}m",
-            (endpoint[0] + 8, endpoint[1] - 8),
+            f"Command{cmd_suffix} dx={cmd_body[0]:+.2f} dy={cmd_body[1]:+.2f} | {cmd_norm:.2f}m",
+            (cmd_px[0] + 8, cmd_px[1] - 8),
             scale=0.48,
             color=CAMERA_CMD_COLOR,
             bg=(45, 45, 45),
+            thickness=1,
+        )
+        draw_text_with_background(
+            frame,
+            f"camera scale={scale_cache.meter_per_pixel * 1000.0:.2f} mm/px ({scale_cache.source})",
+            (10, 28),
+            scale=0.48,
+            color=TEXT_COLOR,
+            bg=TEXT_BG,
             thickness=1,
         )
 
@@ -732,8 +880,10 @@ def render_camera_canvas(
     config,
     run_stats,
     output_path,
+    scale_cache,
     recording_started=False,
     text_overlay_enabled=True,
+    camera_track_points_enabled=True,
 ):
     canvas = frame.copy()
 
@@ -746,7 +896,14 @@ def render_camera_canvas(
         label_color = TAG_AXIS_LABEL_COLOR if visual_pose.source == "TAG" else COLOR_AXIS_LABEL_COLOR
         draw_pose_axes(canvas, visual_pose, label_color, text_overlay_enabled)
 
-    draw_command_arrow(canvas, tracking_result, config, text_overlay_enabled)
+    draw_camera_tracking_points(
+        canvas,
+        tracking_result,
+        config,
+        scale_cache,
+        text_overlay_enabled,
+        enabled=camera_track_points_enabled,
+    )
 
     if text_overlay_enabled:
         draw_overlay(
@@ -915,6 +1072,8 @@ def parse_args():
     parser.add_argument("--no-text-overlay", dest="text_overlay", action="store_false", help="隐藏相机画面文字叠加层。")
     parser.add_argument("--map-canvas", dest="map_canvas", action="store_true", default=MAP_CANVAS_ENABLED, help="在相机画面下方显示参考轨迹地图画布。")
     parser.add_argument("--no-map-canvas", dest="map_canvas", action="store_false", help="隐藏参考轨迹地图画布。")
+    parser.add_argument("--camera-track-points", dest="camera_track_points", action="store_true", default=CAMERA_TRACK_POINTS_ENABLED, help="在相机画面中按物理比例绘制参考轨迹关键点。")
+    parser.add_argument("--no-camera-track-points", dest="camera_track_points", action="store_false", help="隐藏相机画面中的参考轨迹关键点。")
     parser.add_argument("--color-marker", dest="color_marker", action="store_true", default=True, help="启用彩色备用 PnP。")
     parser.add_argument("--no-color-marker", dest="color_marker", action="store_false", help="关闭彩色备用 PnP。")
 
@@ -961,6 +1120,7 @@ def main():
     writer = None
     recording_started = False
     map_renderer = TrackingMapRenderer(enabled=args.map_canvas)
+    scale_cache = CameraPlaneScaleCache()
     run_stats = RunStats()
     last_visual_time = None
     last_loop_time = None
@@ -972,6 +1132,7 @@ def main():
     logger.info(f"MP4 保存: {'关闭' if output_path is None else str(output_path) + '（首次视觉观测后开始写入）'}")
     logger.info(f"文字叠加层: {'开启' if args.text_overlay else '关闭'}")
     logger.info(f"参考轨迹地图画布: {'开启' if args.map_canvas else '关闭'}")
+    logger.info(f"相机画面参考点: {'开启' if args.camera_track_points else '关闭'}")
     logger.info(
         f"跟踪参数: lookahead={config.lookahead_time_s:.2f}s "
         f"max_ref_speed={args.max_ref_speed:.2f}m/s max_cmd={config.max_cmd_offset_m:.2f}m"
@@ -1002,6 +1163,7 @@ def main():
 
             if visual_pose is not None:
                 last_visual_time = now_wall
+                scale_cache.update(visual_pose, now_wall)
             else:
                 run_stats.visual_lost_frames += 1
 
@@ -1037,8 +1199,10 @@ def main():
                 config,
                 run_stats,
                 output_path,
+                scale_cache,
                 recording_started=recording_started,
                 text_overlay_enabled=args.text_overlay,
+                camera_track_points_enabled=args.camera_track_points,
             )
             canvas = map_renderer.compose(camera_canvas, config)
 
