@@ -61,7 +61,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "image_output" / "video"
 DEFAULT_UDP_IP = "10.105.26.61"
 
 # 文字叠加层总开关。False 时只保留相机画面、灰色未知区域和三维坐标架。
-TEXT_OVERLAY_ENABLED = True
+TEXT_OVERLAY_ENABLED = False
 
 TAG_FORWARD_AXIS = "+Y"
 VEHICLE_STATE_TIMEOUT_S = 0.3
@@ -102,6 +102,11 @@ class ViewState:
     scale: float = 1.0
     offset: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=float))
     initialized: bool = False
+    lost_session_active: bool = False
+    bounds_min: Optional[np.ndarray] = None
+    bounds_max: Optional[np.ndarray] = None
+    target_scale: float = 1.0
+    target_offset: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=float))
 
 
 @dataclass
@@ -326,15 +331,13 @@ def rvec_with_body_yaw(base_rvec, desired_yaw_body):
     return best_rvec
 
 
-def estimate_pose_from_vehicle(frame_aligner, vehicle_state, last_visual_pose, last_visual_time, now, fallback_max_s):
+def estimate_pose_from_vehicle(frame_aligner, vehicle_state, last_visual_pose):
     """由车端位姿估计当前降落点在相机/机体系中的 PnP 风格位姿。"""
     if vehicle_state is None:
         return None
-    if last_visual_pose is None or last_visual_time is None:
+    if last_visual_pose is None:
         return None
     if not frame_aligner.initialized:
-        return None
-    if now - last_visual_time > fallback_max_s:
         return None
     if last_visual_pose.z_m <= 0.0:
         return None
@@ -395,67 +398,124 @@ def transform_points(points, view_state: ViewState):
     return points * view_state.scale + view_state.offset
 
 
-def pose_points_inside_frame(pose, width, height):
+def current_visible_bounds(frame_shape, view_state: ViewState):
+    """当前画布对应到原相机图像坐标里的可见范围。"""
+    height, width = frame_shape[:2]
+    if view_state.scale <= 1e-6:
+        return np.array([0.0, 0.0]), np.array([float(width), float(height)])
+
+    canvas_min = (np.array([0.0, 0.0]) - view_state.offset) / view_state.scale
+    canvas_max = (np.array([float(width), float(height)]) - view_state.offset) / view_state.scale
+    fov_min = np.array([0.0, 0.0], dtype=float)
+    fov_max = np.array([float(width), float(height)], dtype=float)
+    return np.minimum(canvas_min, fov_min), np.maximum(canvas_max, fov_max)
+
+
+def pose_near_canvas_edge(pose, frame_shape, view_state: ViewState):
+    """估计坐标架靠近或越过当前输出画面边缘时，触发视野扩展。"""
     points = project_axis_points(pose)
     if not np.all(np.isfinite(points)):
-        return True
-    return bool(
-        np.all(points[:, 0] >= 0.0)
-        and np.all(points[:, 0] <= width - 1)
-        and np.all(points[:, 1] >= 0.0)
-        and np.all(points[:, 1] <= height - 1)
-    )
+        return False
 
-
-def desired_view_transform(frame_shape, pose_for_view):
     height, width = frame_shape[:2]
-    if pose_for_view is None:
-        return 1.0, np.zeros(2, dtype=float)
-
-    if pose_points_inside_frame(pose_for_view, width, height):
-        return 1.0, np.zeros(2, dtype=float)
-
-    axis_points = project_axis_points(pose_for_view)
-    if not np.all(np.isfinite(axis_points)):
-        return 1.0, np.zeros(2, dtype=float)
-
-    fov_corners = np.array(
-        [
-            [0.0, 0.0],
-            [float(width), 0.0],
-            [float(width), float(height)],
-            [0.0, float(height)],
-        ],
-        dtype=float,
+    points = transform_points(points, view_state)
+    return bool(
+        np.any(points[:, 0] < VIEW_MARGIN_PX)
+        or np.any(points[:, 0] > width - VIEW_MARGIN_PX)
+        or np.any(points[:, 1] < VIEW_MARGIN_PX)
+        or np.any(points[:, 1] > height - VIEW_MARGIN_PX)
     )
-    all_points = np.vstack([fov_corners, axis_points])
-    min_xy = np.min(all_points, axis=0)
-    max_xy = np.max(all_points, axis=0)
-    bbox_size = np.maximum(max_xy - min_xy, 1.0)
 
-    available_w = max(1.0, width - 2.0 * VIEW_MARGIN_PX)
-    available_h = max(1.0, height - 2.0 * VIEW_MARGIN_PX)
-    scale = min(1.0, available_w / bbox_size[0], available_h / bbox_size[1])
+
+def transform_from_bounds(frame_shape, bounds_min, bounds_max):
+    """把原图坐标包围盒映射到固定输出画布。"""
+    height, width = frame_shape[:2]
+    bbox_size = np.maximum(bounds_max - bounds_min, 1.0)
+    scale = min(float(width) / bbox_size[0], float(height) / bbox_size[1], 1.0)
     scale = max(MIN_VIEW_SCALE, float(scale))
 
-    bbox_center = (min_xy + max_xy) * 0.5
+    bbox_center = (bounds_min + bounds_max) * 0.5
     canvas_center = np.array([width * 0.5, height * 0.5], dtype=float)
     offset = canvas_center - scale * bbox_center
     return scale, offset
 
 
-def update_view_state(view_state: ViewState, desired_scale, desired_offset, visual_valid):
+def ensure_lost_session_bounds(view_state: ViewState, frame_shape):
+    """进入一轮视觉丢失显示后，初始化只扩不缩的可见范围。"""
+    if view_state.lost_session_active and view_state.bounds_min is not None and view_state.bounds_max is not None:
+        return
+
+    bounds_min, bounds_max = current_visible_bounds(frame_shape, view_state)
+    view_state.lost_session_active = True
+    view_state.bounds_min = bounds_min
+    view_state.bounds_max = bounds_max
+    view_state.target_scale, view_state.target_offset = transform_from_bounds(
+        frame_shape,
+        bounds_min,
+        bounds_max,
+    )
+
+
+def expand_lost_session_view(view_state: ViewState, frame_shape, pose):
+    """
+    视觉丢失期间只扩大视野范围。
+
+    如果小车向回开但尚未重新识别 Tag，bounds 不收缩，因此灰色未知区域不会反复一缩一放。
+    """
+    ensure_lost_session_bounds(view_state, frame_shape)
+    if pose is None or not pose_near_canvas_edge(pose, frame_shape, view_state):
+        return
+
+    points = project_axis_points(pose)
+    if not np.all(np.isfinite(points)):
+        return
+
+    margin_mapped_to_image = VIEW_MARGIN_PX / max(view_state.target_scale, MIN_VIEW_SCALE)
+    pose_min = np.min(points, axis=0) - margin_mapped_to_image
+    pose_max = np.max(points, axis=0) + margin_mapped_to_image
+    view_state.bounds_min = np.minimum(view_state.bounds_min, pose_min)
+    view_state.bounds_max = np.maximum(view_state.bounds_max, pose_max)
+    view_state.target_scale, view_state.target_offset = transform_from_bounds(
+        frame_shape,
+        view_state.bounds_min,
+        view_state.bounds_max,
+    )
+
+
+def update_view_state(view_state: ViewState, frame_shape, visual_valid, estimated_pose):
+    if visual_valid:
+        view_state.lost_session_active = False
+        view_state.bounds_min = None
+        view_state.bounds_max = None
+        desired_scale = 1.0
+        desired_offset = np.zeros(2, dtype=float)
+        view_state.target_scale = desired_scale
+        view_state.target_offset = desired_offset.copy()
+        alpha = 0.12
+    elif estimated_pose is not None:
+        expand_lost_session_view(view_state, frame_shape, estimated_pose)
+        desired_scale = view_state.target_scale
+        desired_offset = view_state.target_offset
+        alpha = 0.22
+    elif view_state.lost_session_active:
+        desired_scale = view_state.target_scale
+        desired_offset = view_state.target_offset
+        alpha = 0.08
+    else:
+        desired_scale = view_state.scale
+        desired_offset = view_state.offset.copy()
+        alpha = 0.08
+
     if not view_state.initialized:
         view_state.scale = desired_scale
         view_state.offset = desired_offset.copy()
         view_state.initialized = True
         return
 
-    alpha = 0.12 if visual_valid else 0.22
     view_state.scale = (1.0 - alpha) * view_state.scale + alpha * desired_scale
     view_state.offset = (1.0 - alpha) * view_state.offset + alpha * desired_offset
 
-    if abs(view_state.scale - 1.0) < 0.003 and np.linalg.norm(view_state.offset) < 1.5:
+    if visual_valid and abs(view_state.scale - 1.0) < 0.003 and np.linalg.norm(view_state.offset) < 1.5:
         view_state.scale = 1.0
         view_state.offset[:] = 0.0
 
@@ -550,7 +610,16 @@ def draw_tag_annotations(frame, visual_pose: PoseObservation):
         cv2.circle(frame, center, 5, (0, 0, 255), -1, cv2.LINE_AA)
 
 
-def draw_overlay(canvas, source, vehicle_state, frame_aligner, errors: ErrorStats, run_stats: RunStats, output_path):
+def draw_overlay(
+    canvas,
+    source,
+    vehicle_state,
+    frame_aligner,
+    errors: ErrorStats,
+    run_stats: RunStats,
+    output_path,
+    recording_started,
+):
     now = time.time()
     vehicle_text = "vehicle=none"
     if vehicle_state is not None:
@@ -588,8 +657,10 @@ def draw_overlay(canvas, source, vehicle_state, frame_aligner, errors: ErrorStat
         stats_text,
         f"frames={run_stats.frame_count} lost={run_stats.visual_lost_frames} ugv_est={run_stats.ugv_pose_est_frames}",
     ]
-    if output_path is not None:
+    if output_path is not None and recording_started:
         lines.append(f"mp4={Path(output_path).name}")
+    elif output_path is not None:
+        lines.append("mp4=waiting first vision")
 
     scale = 0.47
     thickness = 1
@@ -628,6 +699,7 @@ def render_canvas(
     errors,
     run_stats,
     output_path,
+    recording_started=False,
     text_overlay_enabled=True,
 ):
     frame_for_canvas = frame.copy()
@@ -637,9 +709,12 @@ def render_canvas(
     elif text_overlay_enabled and visual_pose is not None and visual_pose.color_observation is not None:
         draw_color_marker_debug(frame_for_canvas, visual_pose.color_observation)
 
-    pose_for_view = estimated_pose if visual_pose is None else None
-    desired_scale, desired_offset = desired_view_transform(frame.shape, pose_for_view)
-    update_view_state(view_state, desired_scale, desired_offset, visual_valid=visual_pose is not None)
+    update_view_state(
+        view_state,
+        frame.shape,
+        visual_valid=visual_pose is not None,
+        estimated_pose=estimated_pose,
+    )
 
     canvas = np.full(frame.shape, UNKNOWN_GRAY, dtype=np.uint8)
     paste_transformed_frame(canvas, frame_for_canvas, view_state)
@@ -651,7 +726,16 @@ def render_canvas(
         draw_pose_axes(canvas, estimated_pose, view_state, EST_AXIS_LABEL_COLOR, text_overlay_enabled)
 
     if text_overlay_enabled:
-        draw_overlay(canvas, source, vehicle_state, frame_aligner, errors, run_stats, output_path)
+        draw_overlay(
+            canvas,
+            source,
+            vehicle_state,
+            frame_aligner,
+            errors,
+            run_stats,
+            output_path,
+            recording_started,
+        )
     return canvas
 
 
@@ -684,7 +768,7 @@ def install_stop_handlers(stop_event):
         thread.start()
 
 
-def print_summary(run_stats: RunStats, errors: ErrorStats, output_path, elapsed_s):
+def print_summary(run_stats: RunStats, errors: ErrorStats, output_path, recording_started, elapsed_s):
     print("=" * 72)
     print("车端姿态融合可视化脚本结束")
     print(f"总帧数: {run_stats.frame_count}")
@@ -703,8 +787,10 @@ def print_summary(run_stats: RunStats, errors: ErrorStats, output_path, elapsed_
         print(f"误差样本数: {errors.count}")
     else:
         print("位置/姿态误差: 无有效样本（需要视觉有效且车端估计可用）")
-    if output_path is not None:
+    if output_path is not None and recording_started:
         print(f"MP4 输出: {output_path}")
+    elif output_path is not None:
+        print("MP4 输出: 未触发录制（本次未观测到视觉标记）")
     else:
         print("MP4 输出: 已关闭")
     print("=" * 72)
@@ -723,7 +809,7 @@ def parse_args():
     parser.add_argument("--no-udp", action="store_true", help="关闭 UDP 图传。")
     parser.add_argument("--preview", action="store_true", help="在本机显示 OpenCV 预览窗口。")
     parser.add_argument("--no-save-video", action="store_true", help="不保存 MP4 视频。")
-    parser.add_argument("--fallback-max-s", type=float, default=5.0, help="视觉丢失后车端位姿估计最长持续时间。")
+    parser.add_argument("--fallback-max-s", type=float, default=5.0, help="兼容保留参数；当前不再用于停止车端位姿估计。")
     parser.add_argument("--text-overlay", dest="text_overlay", action="store_true", default=TEXT_OVERLAY_ENABLED, help="显示右上角文字指标和坐标架文字标签。")
     parser.add_argument("--no-text-overlay", dest="text_overlay", action="store_false", help="隐藏文字叠加层，只保留画面、灰区和坐标架。")
     parser.add_argument("--color-marker", dest="color_marker", action="store_true", default=True, help="启用彩色备用 PnP。")
@@ -761,17 +847,17 @@ def main():
         sender.start()
 
     writer = None
+    recording_started = False
     view_state = ViewState()
     errors = ErrorStats()
     run_stats = RunStats()
     last_visual_pose = None
-    last_visual_time = None
     start_monotonic = time.monotonic()
 
     logger.info("车端姿态融合可视化脚本已启动")
     logger.info(capture_description)
     logger.info(f"UDP 图传: {'关闭' if sender is None else f'{args.udp_ip}:{args.udp_port}'}")
-    logger.info(f"MP4 保存: {'关闭' if output_path is None else output_path}")
+    logger.info(f"MP4 保存: {'关闭' if output_path is None else str(output_path) + '（首次视觉观测后开始写入）'}")
     logger.info(f"文字叠加层: {'开启' if args.text_overlay else '关闭'}")
     logger.info("结束方式：按 Ctrl+C，或在 SSH 终端输入 q 后回车；如果启用 --preview，也可在窗口中按 q 或 Esc。")
 
@@ -795,9 +881,6 @@ def main():
                 frame_aligner,
                 vehicle_state,
                 last_visual_pose,
-                last_visual_time,
-                now_wall,
-                args.fallback_max_s,
             )
 
             if visual_pose is not None and estimated_pose is not None:
@@ -807,7 +890,6 @@ def main():
                 source = visual_pose.source
                 update_alignment(frame_aligner, vehicle_state, visual_pose)
                 last_visual_pose = visual_pose
-                last_visual_time = now_wall
             else:
                 run_stats.visual_lost_frames += 1
                 if estimated_pose is not None:
@@ -815,6 +897,10 @@ def main():
                     run_stats.ugv_pose_est_frames += 1
                 else:
                     source = "NO_TARGET"
+
+            if visual_pose is not None and output_path is not None and not recording_started:
+                recording_started = True
+                logger.info(f"首次视觉观测成功，开始录制 MP4: {output_path}")
 
             canvas = render_canvas(
                 frame,
@@ -827,13 +913,14 @@ def main():
                 errors,
                 run_stats,
                 output_path,
+                recording_started=recording_started,
                 text_overlay_enabled=args.text_overlay,
             )
 
-            if writer is None and output_path is not None:
+            if recording_started and writer is None and output_path is not None:
                 height, width = canvas.shape[:2]
                 writer = make_writer(output_path, (width, height), args.fps)
-            if writer is not None:
+            if recording_started and writer is not None:
                 writer.write(canvas)
 
             if sender is not None:
@@ -860,7 +947,7 @@ def main():
             writer.release()
         cap.release()
         cv2.destroyAllWindows()
-        print_summary(run_stats, errors, output_path, elapsed_s)
+        print_summary(run_stats, errors, output_path, recording_started, elapsed_s)
 
 
 if __name__ == "__main__":
