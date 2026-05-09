@@ -66,6 +66,7 @@ DEFAULT_UDP_IP = "10.105.26.61"
 
 TEXT_OVERLAY_ENABLED = False
 CAMERA_TRACK_POINTS_ENABLED = True
+COLOR_MARKER_DEBUG_OVERLAY_ENABLED = False
 
 TAG_FORWARD_AXIS = "+Y"
 VEHICLE_STATE_TIMEOUT_S = 0.3
@@ -619,12 +620,13 @@ def render_camera_canvas(
     recording_started=False,
     text_overlay_enabled=True,
     camera_track_points_enabled=True,
+    color_marker_debug_overlay_enabled=False,
 ):
     canvas = frame.copy()
 
     if visual_pose is not None and visual_pose.source == "TAG":
         draw_tag_annotations(canvas, visual_pose)
-    elif visual_pose is not None and visual_pose.color_observation is not None:
+    elif color_marker_debug_overlay_enabled and visual_pose is not None and visual_pose.color_observation is not None:
         draw_color_marker_debug(canvas, visual_pose.color_observation)
 
     if visual_pose is not None:
@@ -807,6 +809,8 @@ def parse_args():
     parser.add_argument("--no-text-overlay", dest="text_overlay", action="store_false", help="隐藏相机画面文字叠加层。")
     parser.add_argument("--camera-track-points", dest="camera_track_points", action="store_true", default=CAMERA_TRACK_POINTS_ENABLED, help="在相机画面中按物理比例绘制参考轨迹关键点。")
     parser.add_argument("--no-camera-track-points", dest="camera_track_points", action="store_false", help="隐藏相机画面中的参考轨迹关键点。")
+    parser.add_argument("--color-marker-debug-overlay", dest="color_marker_debug_overlay", action="store_true", default=COLOR_MARKER_DEBUG_OVERLAY_ENABLED, help="显示彩色备用视觉的检测框和文字调试叠加层。")
+    parser.add_argument("--no-color-marker-debug-overlay", dest="color_marker_debug_overlay", action="store_false", help="隐藏彩色备用视觉的检测框和文字调试叠加层。")
     parser.add_argument("--color-marker", dest="color_marker", action="store_true", default=True, help="启用彩色备用 PnP。")
     parser.add_argument("--no-color-marker", dest="color_marker", action="store_false", help="关闭彩色备用 PnP。")
 
@@ -864,6 +868,7 @@ def main():
     logger.info(f"MP4 保存: {'关闭' if output_path is None else str(output_path) + '（首次视觉观测后开始写入）'}")
     logger.info(f"文字叠加层: {'开启' if args.text_overlay else '关闭'}")
     logger.info(f"相机画面参考点: {'开启' if args.camera_track_points else '关闭'}")
+    logger.info(f"彩色标记调试叠加层: {'开启' if args.color_marker_debug_overlay else '关闭'}")
     logger.info(
         f"跟踪参数: lookahead={config.lookahead_time_s:.2f}s "
         f"max_ref_speed={args.max_ref_speed:.2f}m/s max_cmd={config.max_cmd_offset_m:.2f}m"
@@ -933,6 +938,7 @@ def main():
                 recording_started=recording_started,
                 text_overlay_enabled=args.text_overlay,
                 camera_track_points_enabled=args.camera_track_points,
+                color_marker_debug_overlay_enabled=args.color_marker_debug_overlay,
             )
 
             if recording_started and writer is None and output_path is not None:

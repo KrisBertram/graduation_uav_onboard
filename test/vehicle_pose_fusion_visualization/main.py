@@ -62,6 +62,7 @@ DEFAULT_UDP_IP = "10.105.26.61"
 
 # 文字叠加层总开关。False 时只保留相机画面、灰色未知区域和三维坐标架。
 TEXT_OVERLAY_ENABLED = False
+COLOR_MARKER_DEBUG_OVERLAY_ENABLED = False
 
 TAG_FORWARD_AXIS = "+Y"
 VEHICLE_STATE_TIMEOUT_S = 0.3
@@ -713,12 +714,13 @@ def render_canvas(
     output_path,
     recording_started=False,
     text_overlay_enabled=True,
+    color_marker_debug_overlay_enabled=False,
 ):
     frame_for_canvas = frame.copy()
 
     if visual_pose is not None and visual_pose.source == "VISION_TAG":
         draw_tag_annotations(frame_for_canvas, visual_pose)
-    elif text_overlay_enabled and visual_pose is not None and visual_pose.color_observation is not None:
+    elif color_marker_debug_overlay_enabled and visual_pose is not None and visual_pose.color_observation is not None:
         draw_color_marker_debug(frame_for_canvas, visual_pose.color_observation)
 
     update_view_state(
@@ -824,6 +826,8 @@ def parse_args():
     parser.add_argument("--fallback-max-s", type=float, default=5.0, help="兼容保留参数；当前不再用于停止车端位姿估计。")
     parser.add_argument("--text-overlay", dest="text_overlay", action="store_true", default=TEXT_OVERLAY_ENABLED, help="显示右上角文字指标和坐标架文字标签。")
     parser.add_argument("--no-text-overlay", dest="text_overlay", action="store_false", help="隐藏文字叠加层，只保留画面、灰区和坐标架。")
+    parser.add_argument("--color-marker-debug-overlay", dest="color_marker_debug_overlay", action="store_true", default=COLOR_MARKER_DEBUG_OVERLAY_ENABLED, help="显示彩色备用视觉的检测框和文字调试叠加层。")
+    parser.add_argument("--no-color-marker-debug-overlay", dest="color_marker_debug_overlay", action="store_false", help="隐藏彩色备用视觉的检测框和文字调试叠加层。")
     parser.add_argument("--color-marker", dest="color_marker", action="store_true", default=True, help="启用彩色备用 PnP。")
     parser.add_argument("--no-color-marker", dest="color_marker", action="store_false", help="关闭彩色备用 PnP。")
 
@@ -871,6 +875,7 @@ def main():
     logger.info(f"UDP 图传: {'关闭' if sender is None else f'{args.udp_ip}:{args.udp_port}'}")
     logger.info(f"MP4 保存: {'关闭' if output_path is None else str(output_path) + '（首次视觉观测后开始写入）'}")
     logger.info(f"文字叠加层: {'开启' if args.text_overlay else '关闭'}")
+    logger.info(f"彩色标记调试叠加层: {'开启' if args.color_marker_debug_overlay else '关闭'}")
     logger.info("结束方式：按 Ctrl+C，或在 SSH 终端输入 q 后回车；如果启用 --preview，也可在窗口中按 q 或 Esc。")
 
     if args.preview:
@@ -927,6 +932,7 @@ def main():
                 output_path,
                 recording_started=recording_started,
                 text_overlay_enabled=args.text_overlay,
+                color_marker_debug_overlay_enabled=args.color_marker_debug_overlay,
             )
 
             if recording_started and writer is None and output_path is not None:
