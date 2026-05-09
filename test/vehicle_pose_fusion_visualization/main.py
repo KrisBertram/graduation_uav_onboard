@@ -234,8 +234,20 @@ def make_writer(output_path: Path, frame_size, fps):
     return writer
 
 
-def vehicle_xy(vehicle_state):
-    return np.array([vehicle_state.pos_x, vehicle_state.pos_y], dtype=float)
+def vehicle_xy_for_body_visualization(vehicle_state):
+    """
+    车端坐标转换到本脚本使用的机体系可视化平面。
+
+    车端原始坐标: +X 为车头初始方向，+Y 为车体左侧，yaw 逆时针为正。
+    机体系显示:   +X 为无人机前方，+Y 为无人机右侧，yaw 顺时针为正。
+    因此进入 FrameAligner 前需要把车端 Y 取反，否则转弯轨迹会左右镜像。
+    """
+    return np.array([vehicle_state.pos_x, -vehicle_state.pos_y], dtype=float)
+
+
+def vehicle_yaw_for_body_visualization(vehicle_state):
+    """车端逆时针为正的 yaw 转为机体系显示中顺时针为正的 yaw。"""
+    return -vehicle_state.yaw_rad
 
 
 def detect_visual_observation(frame_bgr, detector, color_marker_enabled):
@@ -342,8 +354,8 @@ def estimate_pose_from_vehicle(frame_aligner, vehicle_state, last_visual_pose):
     if last_visual_pose.z_m <= 0.0:
         return None
 
-    body_xy = frame_aligner.transform_point(vehicle_xy(vehicle_state))
-    desired_yaw_body = wrap_angle(vehicle_state.yaw_rad + frame_aligner.theta)
+    body_xy = frame_aligner.transform_point(vehicle_xy_for_body_visualization(vehicle_state))
+    desired_yaw_body = wrap_angle(vehicle_yaw_for_body_visualization(vehicle_state) + frame_aligner.theta)
     pnp_x = float(body_xy[1])
     pnp_y = float(-body_xy[0])
     pnp_z = float(last_visual_pose.z_m)
@@ -366,8 +378,8 @@ def update_alignment(frame_aligner, vehicle_state, visual_pose):
     if vehicle_state is None or visual_pose is None:
         return
     frame_aligner.update(
-        vehicle_xy(vehicle_state),
-        vehicle_state.yaw_rad,
+        vehicle_xy_for_body_visualization(vehicle_state),
+        vehicle_yaw_for_body_visualization(vehicle_state),
         visual_pose.body_xy,
         visual_pose.yaw_body,
     )
