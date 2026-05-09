@@ -1,5 +1,9 @@
 """
-无人车坐标系到无人机局部坐标系的在线对齐。
+输入目标坐标系到无人机局部坐标系的在线对齐。
+
+注意：FrameAligner 只估计二维旋转和平移，不估计镜像变换。调用方必须保证输入的
+xy/yaw 与无人机局部跟踪平面同手性；例如车端原始 +Y 为左、yaw 逆时针为正时，需要
+先转换成 +Y 为右、yaw 顺时针为正后再传入本类。
 """
 
 import math
@@ -35,7 +39,7 @@ def blend_angle(old, new, alpha):
 
 class FrameAligner:
     """
-    估计二维变换 T_drone_from_vehicle = R(theta) + t。
+    估计二维变换 T_drone_from_source = R(theta) + t。
 
     第一帧视觉有效时直接锁定变换；之后每次看到 Tag 都用低通方式修正。
     """
@@ -51,8 +55,8 @@ class FrameAligner:
         """
         用同一时刻的车端位姿和视觉观测更新坐标系对齐。
 
-        vehicle_xy      : 无人车坐标系下车辆参考点位置 [x, y]
-        vehicle_yaw_rad : 无人车坐标系下车头朝向，逆时针为正
+        vehicle_xy      : 已转换到跟踪平面约定的目标参考点位置 [x, y]
+        vehicle_yaw_rad : 已转换到跟踪平面约定的目标前向角
         target_xy_drone : 视觉观测得到的 Tag/平台中心在无人机局部系的位置
         tag_yaw_drone   : 视觉观测得到的 Tag/车头朝向在无人机局部系的角度
         """
@@ -83,15 +87,15 @@ class FrameAligner:
         )
 
     def transform_point(self, vehicle_xy):
-        """无人车坐标系点 -> 无人机局部坐标系点。"""
+        """输入目标坐标系点 -> 无人机局部坐标系点。"""
         return rotate_xy(vehicle_xy, self.theta) + self.translation
 
     def transform_vector(self, vehicle_vec_xy):
-        """无人车坐标系向量 -> 无人机局部坐标系向量。"""
+        """输入目标坐标系向量 -> 无人机局部坐标系向量。"""
         return rotate_xy(vehicle_vec_xy, self.theta)
 
     def vehicle_velocity_to_drone(self, speed, vehicle_yaw_rad):
-        """由车端 speed+yaw 得到无人机局部坐标系下的前馈速度。"""
+        """由已转换到跟踪平面约定的 speed+yaw 得到无人机局部系前馈速度。"""
         vehicle_vel = np.array([
             speed * math.cos(vehicle_yaw_rad),
             speed * math.sin(vehicle_yaw_rad),

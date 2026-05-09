@@ -64,13 +64,25 @@ class TrackingCommandResult:
 
 
 def _vehicle_xy(vehicle_state):
-    return np.array([vehicle_state.pos_x, vehicle_state.pos_y], dtype=float)
+    """
+    将车端原始位置转换到跟踪平面约定。
+
+    车端原始坐标: +X 为开机车头方向，+Y 为车体左侧，yaw 逆时针为正。
+    跟踪/视觉平面: +X 为前方，+Y 为右侧，yaw 顺时针为正。
+    FrameAligner 只估计旋转和平移，不包含镜像；这里必须先把车端 Y 取反。
+    """
+    return np.array([vehicle_state.pos_x, -vehicle_state.pos_y], dtype=float)
+
+
+def _vehicle_yaw(vehicle_state):
+    """车端逆时针为正的 yaw 转为跟踪平面中顺时针为正的 yaw。"""
+    return -vehicle_state.yaw_rad
 
 
 def _vehicle_velocity(vehicle_state, frame_aligner):
     return frame_aligner.vehicle_velocity_to_drone(
         vehicle_state.speed,
-        vehicle_state.yaw_rad,
+        _vehicle_yaw(vehicle_state),
     )
 
 
@@ -247,7 +259,7 @@ def build_tracking_command(
         if vehicle_state is not None and frame_aligner is not None and tag_yaw_drone is not None:
             frame_aligner.update(
                 _vehicle_xy(vehicle_state),
-                vehicle_state.yaw_rad,
+                _vehicle_yaw(vehicle_state),
                 target_xy,
                 tag_yaw_drone,
             )
