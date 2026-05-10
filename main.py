@@ -182,11 +182,11 @@ VEHICLE_VEL_WEIGHT = 0.6
 
 # 视觉有效时是否允许融合车端位置。关闭后仍可使用车端速度前馈和更新 FrameAligner。
 # 调试建议：车端坐标、yaw、FrameAligner 首次对齐未确认前可先设 False；确认后设 True。
-VEHICLE_POSE_FUSION_ENABLED = False
+VEHICLE_POSE_FUSION_ENABLED = True
 
 # 视觉失效时是否允许车端位姿接管参考点。必须先完成 FrameAligner 对齐，否则不会启用。
 # 调试建议：首次实测可先保持 True 但让 DATALINK_ENABLED=False 观察日志；确认 source=UGV_POSE 稳定后再接飞控。
-VEHICLE_POSE_FALLBACK_ENABLED = False
+VEHICLE_POSE_FALLBACK_ENABLED = True
 
 # 车端位姿 fallback 最长持续时间：距离上次视觉成功超过该时间后，不再单独相信车端位姿。
 # 调大：长时间视觉丢失仍能跟随车端轨迹；过大时坐标系漂移后风险增加。
